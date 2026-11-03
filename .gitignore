@@ -1,0 +1,27 @@
+# Rust / Anchor
+target/
+.anchor/
+test-ledger/
+**/*.rs.bk
+
+# Node
+node_modules/
+dist/
+.env
+.env.*
+
+# Keys — never commit
+*.pem
+**/deploy/*-keypair.json
+
+# Misc
+.DS_Store
+
+# Keys and secrets: never commit them
+*keypair*.json
+id.json
+*.pem
+*.key
+rpc.txt
+.env
+.env.*

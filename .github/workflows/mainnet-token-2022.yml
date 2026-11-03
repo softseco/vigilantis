@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: BUSL-1.1
+#
+# Runs the integration and fuzz tests against the Token-2022 program deployed on mainnet, so a
+# Token-2022 upgrade there that changes Vigilantis's behaviour shows up within a week. The main CI
+# uses the pinned v11.1.0 build in tests/fixtures. This workflow reads mainnet through the public
+# RPC endpoint, so it runs on a schedule and by hand rather than on every push.
+name: mainnet Token-2022
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"   # Mondays, 05:17 UTC
+  workflow_dispatch:
+
+env:
+  SOLANA_VERSION: "4.2.2"
+
+jobs:
+  test:
+    name: tests against mainnet Token-2022
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            tests-fuzz
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.local/share/solana
+            ~/.cache/solana
+          key: solana-${{ env.SOLANA_VERSION }}-mainnet-token-2022
+      - name: Install the Solana toolchain
+        run: |
+          if [ ! -x "$HOME/.local/share/solana/install/active_release/bin/solana" ]; then
+            sh -c "$(curl -sSfL https://release.anza.xyz/v${SOLANA_VERSION}/install)"
+          fi
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - run: npm ci
+      - run: solana-keygen new --no-bip39-passphrase -s -o "$HOME/.config/solana/id.json"
+      - run: bash scripts/mainnet-token-2022.sh

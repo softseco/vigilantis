@@ -1,0 +1,151 @@
+# SPDX-License-Identifier: BUSL-1.1
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+env:
+  SOLANA_VERSION: "4.2.2"
+  ANCHOR_VERSION: "0.31.1"
+
+jobs:
+  program:
+    name: program (fmt, clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy -p vigilantis --all-targets -- -D warnings
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Fails on a known vulnerability in Cargo.lock. Warnings (unmaintained or unsound crates
+      # deep in the Solana dependency tree) are reported but do not fail the job.
+      - run: cargo audit
+      - run: cargo audit --file tests-fuzz/Cargo.lock
+
+  integration:
+    name: integration (build, IDL check, tests on a local validator)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      # `anchor idl build` calls `cargo +nightly`; stable stays the default.
+      - run: rustup toolchain install nightly --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.local/share/solana
+            ~/.cache/solana
+          key: solana-${{ env.SOLANA_VERSION }}-anchor-${{ env.ANCHOR_VERSION }}
+      - name: Install the Solana toolchain and Anchor
+        run: |
+          if [ ! -x "$HOME/.local/share/solana/install/active_release/bin/solana" ]; then
+            sh -c "$(curl -sSfL https://release.anza.xyz/v${SOLANA_VERSION}/install)"
+          fi
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+          mkdir -p "$HOME/.local/bin"
+          curl -sSfL -o "$HOME/.local/bin/anchor" \
+            "https://github.com/solana-foundation/anchor/releases/download/v${ANCHOR_VERSION}/anchor-${ANCHOR_VERSION}-x86_64-unknown-linux-gnu"
+          chmod +x "$HOME/.local/bin/anchor"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: solana --version && anchor --version
+      - name: Build the program
+        run: anchor build --no-idl
+      - name: Check the program's security.txt
+        run: bash scripts/check-security-txt.sh
+      - name: Check that the committed IDL matches the program
+        run: |
+          # anchor 0.31.1's IDL build needs proc-macro2's span features, which stable Rust keeps
+          # behind RUSTC_BOOTSTRAP. Without it the build fails with "cannot find value `mint` in this
+          # scope" in #[derive(Accounts)]. It applies to this step only.
+          RUSTC_BOOTSTRAP=1 anchor idl build -o target/idl/vigilantis.json -t target/types/vigilantis.ts
+          git diff --no-index --exit-code sdk/src/idl/vigilantis.json target/idl/vigilantis.json
+          git diff --no-index --exit-code sdk/src/idl/vigilantis.ts target/types/vigilantis.ts
+      - name: Test on a local validator
+        run: |
+          npm ci
+          # `anchor test` needs a provider wallet; the local validator funds it.
+          solana-keygen new --no-bip39-passphrase -s -o "$HOME/.config/solana/id.json"
+          anchor test --skip-build
+      - name: Validator log
+        if: failure()
+        run: tail -n 40 .anchor/test-ledger/validator.log || true
+
+  fuzz:
+    name: model-based fuzzing (LiteSVM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            tests-fuzz
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.local/share/solana
+            ~/.cache/solana
+          key: solana-${{ env.SOLANA_VERSION }}-anchor-${{ env.ANCHOR_VERSION }}
+      - name: Install the Solana toolchain
+        run: |
+          if [ ! -x "$HOME/.local/share/solana/install/active_release/bin/solana" ]; then
+            sh -c "$(curl -sSfL https://release.anza.xyz/v${SOLANA_VERSION}/install)"
+          fi
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - name: Build the program
+        run: cargo build-sbf --manifest-path programs/vigilantis/Cargo.toml
+      - name: Lint the fuzz tests
+        working-directory: tests-fuzz
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+      # Roles, pause and seizure, one situation at a time; seizure needs the clock moved 24 hours.
+      - name: Enforcement tests (LiteSVM)
+        working-directory: tests-fuzz
+        run: cargo test --test enforcement
+      # A new random set of cases on every run; a failure prints the FUZZ_SEED that reproduces it.
+      - name: Fuzz
+        working-directory: tests-fuzz
+        env:
+          FUZZ_SEED: ${{ github.run_id }}
+          FUZZ_CASES: "256"
+        run: cargo test --test model -- --nocapture
+
+  sdk:
+    name: sdk (typecheck, build, CLI)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - run: npm install
+      - run: npm run typecheck
+      - run: npm run build
+      # The built command starts and prints its help (tests/cli.ts runs the commands themselves).
+      - run: node dist/cli.js --help

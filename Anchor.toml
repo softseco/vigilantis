@@ -1,0 +1,39 @@
+[toolchain]
+package_manager = "npm"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+vigilantis = "4DoDFZJmJWYuBx86UqXi3y24GkQ3Cq4nUBHZwDE5PQM5"
+
+# Vigilantis's own program ID, from its first devnet deployment on. The Sentinel program at
+# 5fH1jj6XeZC96jPCxKiSb2onAXcs7f4rMeqMmSsP6puD stays as it is. docs/deployment.md has the steps.
+[programs.devnet]
+vigilantis = "4DoDFZJmJWYuBx86UqXi3y24GkQ3Cq4nUBHZwDE5PQM5"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "npx ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+
+# The confidential-transfer tests need a Token-2022 that matches @solana-program/token-2022 0.19
+# (tests/fixtures/README.md says where it comes from) and a solana-test-validator from Agave 4.x.
+# Older Agave releases also keep the ZK ElGamal Proof Program behind the gate below; turning it off
+# changes nothing on 4.2, where the program runs either way.
+[[test.genesis]]
+address = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+program = "tests/fixtures/spl_token_2022.so"
+upgradeable = true
+
+[test.validator]
+deactivate_feature = ["zkdoVwnSFnSLtGJG7irJPEYUpmb4i7sGMGcnN6T9rnC"]
+# Once [test.validator] exists, anchor 0.31 passes --bind-address 0.0.0.0, which Agave 4.x
+# rejects at startup (UnspecifiedIpAddr). The tests only need localhost.
+bind_address = "127.0.0.1"

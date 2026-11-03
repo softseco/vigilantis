@@ -1,0 +1,70 @@
+{
+  "name": "@softseco/vigilantis",
+  "version": "1.0.0-rc.1",
+  "license": "BUSL-1.1",
+  "description": "TypeScript SDK for Vigilantis — programmable compliance for Token-2022 tokenized assets (Transfer Hooks).",
+  "keywords": [
+    "solana",
+    "token-2022",
+    "transfer-hook",
+    "compliance",
+    "allowlist",
+    "blocklist",
+    "rwa",
+    "tokenization",
+    "anchor"
+  ],
+  "author": "Joachim Szamborski (Softseco)",
+  "homepage": "https://github.com/softseco/vigilantis#readme",
+  "bugs": {
+    "url": "https://github.com/softseco/vigilantis/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/softseco/vigilantis.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "type": "commonjs",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "vigilantis": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean && tsup src/cli.ts --format cjs",
+    "typecheck": "tsc --noEmit",
+    "demo": "tsx examples/compliant-asset-demo.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.31.0",
+    "@noble/hashes": "^1.8.0",
+    "@solana/spl-token": "^0.4.13",
+    "@solana/web3.js": "^1.98.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsup": "^8.5.0",
+    "tsx": "^4.19.1",
+    "typescript": "^5.7.3"
+  }
+}
