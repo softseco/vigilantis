@@ -5,7 +5,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The on-chain
 `@softseco/vigilantis` SDK are versioned together. Until 28 Oct 2026 the project was Sentinel
 (`@softseco/sentinel`, up to 2.3.0); that history is kept below, under Sentinel's version numbers.
 
-## [1.0.0-rc.2] - Unreleased
+## [1.0.0-rc.2] - 2026-11-05
 
 Forfeiture, for a case that ends with a balance Vigilantis cannot seize, and reasons that are
 optional on the command line. A mint that never forfeits behaves as in 1.0.0-rc.1, but
@@ -44,6 +44,7 @@ that builds them by hand must add it before the program is upgraded.
   all, every one caught with 256 cases.
 
 ### Changed
+- The npm package's README (`sdk/README.md`) starts with the project's banner.
 - **`freeze_token_account` and `thaw_token_account` take the account's forfeiture-record address**
   (`["forfeiture", mint, token_account]`, read-only, need not exist) before the optional role
   entry: the thaw checks it, and the two instructions share their accounts. The SDK passes it.
@@ -79,6 +80,9 @@ that builds them by hand must add it before the program is upgraded.
   program.
 - `COMMERCIAL-LICENSE.md` gave 2 November 2030 as the Change Date of 1.0.0-rc.1; `LICENSE` says
   2030-11-03, which is what counts.
+
+### Licence
+- 1.0.0-rc.2 becomes Apache-2.0 on its Change Date, 2030-11-05 (`LICENSE`, `sdk/LICENSE`).
 
 ## [1.0.0-rc.1] - 2026-11-03
 

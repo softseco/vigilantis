@@ -1,6 +1,6 @@
 # Vigilantis threat model
 
-Version 1.0.0-rc.2, November 2026 (1.0.0-rc.1: 3 November 2026). First written for 2.1.0 on 12 October; the version
+Version 1.0.0-rc.2, 5 November 2026 (1.0.0-rc.1: 3 November 2026). First written for 2.1.0 on 12 October; the version
 numbers 2.0 to 2.3 below are releases of Sentinel, as the project was called until 28 October.
 Written by the author as part of a self-review. Vigilantis has not been independently
 audited; this document is meant to make that audit faster and cheaper. What to read, how to build

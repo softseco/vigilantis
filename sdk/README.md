@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/softseco/vigilantis/main/.github/banner.jpg" alt="Vigilantis: public rules on Solana" width="100%"></p>
+
 # @softseco/vigilantis
 
 TypeScript SDK for **Vigilantis** — programmable compliance for Token-2022 tokenized assets, built on
