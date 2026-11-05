@@ -52,6 +52,7 @@ pub mod code {
     pub const NOT_IN_TRANSFER: u32 = 6017;
     pub const OWNER_CAN_CHANGE: u32 = 6018;
     pub const PAUSED_MINT_HANDOVER: u32 = 6019;
+    pub const ACCOUNT_FORFEITED: u32 = 6020;
 }
 
 /// Anchor's own error codes that the model predicts.
@@ -136,6 +137,9 @@ pub fn freeze_record_pda(mint: &Pubkey, account: &Pubkey) -> Pubkey {
 pub fn seizure_pda(mint: &Pubkey, account: &Pubkey, case_ref: &[u8; 32]) -> Pubkey {
     pda(&[b"seizure", mint.as_ref(), account.as_ref(), case_ref])
 }
+pub fn forfeiture_pda(mint: &Pubkey, account: &Pubkey) -> Pubkey {
+    pda(&[b"forfeiture", mint.as_ref(), account.as_ref()])
+}
 
 /// The first 8 bytes of sha256(`preimage`).
 fn discriminator(preimage: &str) -> [u8; 8] {
@@ -210,6 +214,8 @@ pub enum Action {
     Resume,
     Seize,
     CloseSeizure,
+    Forfeit,
+    ReleaseForfeiture,
 }
 
 /// A decoded `FreezeAuthorityChanged` event (2.3).
@@ -366,6 +372,7 @@ pub mod ix {
                 r(TOKEN_2022_ID),
                 w(freeze_record_pda(&mint, &token_account)),
                 r(SYSTEM_ID),
+                r(forfeiture_pda(&mint, &token_account)),
                 no_role(),
             ],
         )
@@ -483,6 +490,53 @@ pub mod ix {
                 r(policy_pda(&mint)),
                 w(seizure_pda(&mint, &token_account, &case_ref)),
                 no_role(),
+            ],
+        )
+    }
+
+    /// `forfeit` with an optional `amount_commitment` (all zeros for none).
+    pub fn forfeit(
+        authority: Pubkey,
+        mint: Pubkey,
+        token_account: Pubkey,
+        reason: Reason,
+        amount_commitment: [u8; 32],
+    ) -> Instruction {
+        let mut args = reason.args();
+        args.extend_from_slice(&amount_commitment);
+        anchor_ix(
+            "forfeit",
+            &args,
+            vec![
+                ws(authority),
+                r(mint),
+                r(policy_pda(&mint)),
+                r(token_account),
+                r(freeze_record_pda(&mint, &token_account)),
+                w(forfeiture_pda(&mint, &token_account)),
+                r(freeze_authority_pda(&mint)),
+                r(TOKEN_2022_ID),
+                r(SYSTEM_ID),
+                no_role(),
+            ],
+        )
+    }
+
+    /// `release_forfeiture` with `reason_code` (the admin only; no role account).
+    pub fn release_forfeiture(
+        authority: Pubkey,
+        mint: Pubkey,
+        token_account: Pubkey,
+        reason_code: u16,
+    ) -> Instruction {
+        anchor_ix(
+            "release_forfeiture",
+            &reason_code.to_le_bytes(),
+            vec![
+                ws(authority),
+                r(mint),
+                r(policy_pda(&mint)),
+                w(forfeiture_pda(&mint, &token_account)),
             ],
         )
     }
@@ -805,6 +859,8 @@ pub fn enforcement_events(logs: &[String]) -> Vec<Enforcement> {
             5 => Action::Resume,
             6 => Action::Seize,
             7 => Action::CloseSeizure,
+            8 => Action::Forfeit,
+            9 => Action::ReleaseForfeiture,
             other => panic!("unknown EnforcementKind {other}"),
         };
         events.push(Enforcement {
@@ -1113,6 +1169,20 @@ pub fn read_seizure(
 ) -> Option<u64> {
     let data = vigilantis_account(svm, &seizure_pda(mint, account, case_ref))?.data;
     Some(u64::from_le_bytes(data[104..112].try_into().unwrap()))
+}
+
+/// A forfeiture: the case reference, the amount commitment and who recorded it.
+pub fn read_forfeiture(
+    svm: &LiteSVM,
+    mint: &Pubkey,
+    account: &Pubkey,
+) -> Option<([u8; 32], [u8; 32], Pubkey)> {
+    let data = vigilantis_account(svm, &forfeiture_pda(mint, account))?.data;
+    // discriminator 8, mint 32, wallet 32, token_account 32, reason_code 2, then case_ref.
+    let case_ref = data[106..138].try_into().unwrap();
+    let commitment = data[138..170].try_into().unwrap();
+    let authority = Pubkey::new_from_array(data[170..202].try_into().unwrap());
+    Some((case_ref, commitment, authority))
 }
 
 /// The mint's supply.

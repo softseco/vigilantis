@@ -1,6 +1,6 @@
 {
   "name": "@softseco/vigilantis",
-  "version": "1.0.0-rc.1",
+  "version": "1.0.0-rc.2",
   "license": "BUSL-1.1",
   "description": "TypeScript SDK for Vigilantis — programmable compliance for Token-2022 tokenized assets (Transfer Hooks).",
   "keywords": [
@@ -31,7 +31,7 @@
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",
   "bin": {
-    "vigilantis": "./dist/cli.js"
+    "vigilantis": "dist/cli.js"
   },
   "exports": {
     ".": {

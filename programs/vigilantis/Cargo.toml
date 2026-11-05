@@ -1,6 +1,6 @@
 [package]
 name = "vigilantis"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 description = "Programmable compliance for Token-2022 tokenized assets, built on Transfer Hooks."
 edition = "2021"
 

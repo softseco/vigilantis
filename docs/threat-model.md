@@ -1,6 +1,6 @@
 # Vigilantis threat model
 
-Version 1.0.0-rc.1, 3 November 2026. First written for 2.1.0 on 12 October; the version
+Version 1.0.0-rc.2, November 2026 (1.0.0-rc.1: 3 November 2026). First written for 2.1.0 on 12 October; the version
 numbers 2.0 to 2.3 below are releases of Sentinel, as the project was called until 28 October.
 Written by the author as part of a self-review. Vigilantis has not been independently
 audited; this document is meant to make that audit faster and cheaper. What to read, how to build
@@ -8,13 +8,13 @@ and test it, and what the hook costs are in [audit-scope.md](./audit-scope.md).
 
 ## Scope
 
-The on-chain program in `programs/vigilantis/src/lib.rs`: one file, about 1,900 lines of Rust
-without blank lines and comments, built with Anchor 0.31.1. Twenty-seven instructions:
+The on-chain program in `programs/vigilantis/src/lib.rs`: one file, about 2,100 lines of Rust
+without blank lines and comments, built with Anchor 0.31.1. Twenty-nine instructions:
 `initialize_policy`, `update_policy`, `initialize_extra_account_meta_list`,
 `update_extra_account_meta_list`, `add_to_allowlist`, `remove_from_allowlist`, `add_to_blocklist`,
 `remove_from_blocklist`, `block_wallet`, `unblock_wallet`, `freeze_token_account`,
 `thaw_token_account`, `set_freeze_authority`, `pause`, `resume`, `set_pause_authority`, `seize`,
-`close_seizure`, `grant_role`, `update_role`, `revoke_role`, `renounce_role`, `propose_authority`,
+`close_seizure`, `forfeit`, `release_forfeiture`, `grant_role`, `update_role`, `revoke_role`, `renounce_role`, `propose_authority`,
 `cancel_authority_transfer`, `accept_authority`, `transfer_hook`, and the `fallback` that routes
 Token-2022's `Execute` call to `transfer_hook`.
 
@@ -48,8 +48,14 @@ An issuer's rules for one Token-2022 mint, enforced on every transfer of that mi
   anyone: the reserve behind the burnt tokens stays with the issuer, and paying out under the
   judgment is the issuer's own step, off this program. A `SeizureRecord` stays open until
   `close_seizure` records the outcome.
+- **Forfeiture** (1.0.0-rc.2): when a case ends and the balance could not be seized, above all a
+  confidential one, `forfeit` keeps a `ForfeitureRecord` for a token account that Vigilantis froze
+  at least 24 hours before. From then on `thaw_token_account` refuses the account, whoever signs,
+  until the admin's `release_forfeiture` (for example after an appeal). Nothing is burnt or moved:
+  the tokens stay in the supply, and the issuer reports them apart from the supply in circulation.
 - **Roles** (1.0): the policy authority can give other addresses some of nine permissions
-  (allowlist, block, unblock, freeze, thaw, pause, resume, seize, close seizure), so that a
+  (allowlist, block, unblock, freeze, thaw, pause, resume, seize, close seizure; seize also covers
+  `forfeit`), so that a
   compliance officer can, say, freeze but not thaw, without holding the key that changes the rules.
 - **Record** (2.2): `block_wallet`, `unblock_wallet`, `freeze_token_account` and
   `thaw_token_account` take the issuer's reason code and a 32-byte case reference and put them,
@@ -57,12 +63,16 @@ An issuer's rules for one Token-2022 mint, enforced on every transfer of that mi
   the same in a `FreezeAuthorityChanged` event, and in 1.0 `pause`, `resume`, `seize` and
   `close_seizure` emit `EnforcementAction` too, `set_pause_authority` emits
   `PauseAuthorityChanged`, `seize` and `close_seizure` emit `Seized` and `SeizureClosed`, and the
-  role instructions emit `RoleChanged`.
+  role instructions emit `RoleChanged`. In 1.0.0-rc.2 `forfeit` and `release_forfeiture` emit
+  `EnforcementAction` with `Forfeited` and `ForfeitureReleased`. The reason code and the case
+  reference are the issuer's to give: only `seize`, `forfeit` (and `close_seizure` and
+  `release_forfeiture`, which reuse the case of their record) need a case reference, so a freeze,
+  a block or a pause never waits for paperwork.
 
 The state that carries these rules: one `PolicyConfig` per mint, one `AllowEntry` or `BlockEntry`
 per listed wallet, the mint's `ExtraAccountMetaList`, a `PendingAuthority` while a handover is
-in progress, one `RoleEntry` per role holder, one `FreezeRecord` per account Vigilantis froze, and
-one `SeizureRecord` per open seizure. All are PDAs of the program, seeded by the mint. The freeze,
+in progress, one `RoleEntry` per role holder, one `FreezeRecord` per account Vigilantis froze,
+one `SeizureRecord` per open seizure, and one `ForfeitureRecord` per forfeited account. All are PDAs of the program, seeded by the mint. The freeze,
 pause and permanent-delegate addresses hold no data; they only sign. A token account's frozen state
 lives in the token account and a mint's paused state in the mint, both kept by Token-2022.
 
@@ -70,8 +80,8 @@ lives in the token account and a mint's paused state in the mint, both kept by T
 
 | Actor | Trust | What it can do |
 |---|---|---|
-| Policy authority (the admin) | Fully trusted for its mint | Change the rules and the lists, hand the policy over, rewrite the meta list, grant and take away roles. It can also stop every transfer of the mint (for example, allowlist on and empty). On a mint that gave Vigilantis its freeze authority, it can freeze any holder's token account, for as long as it likes (2.2), and hand the freeze authority to any address or give it up (2.3). On a mint that gave Vigilantis its pause authority and permanent delegate, it can pause the whole token and, 24 hours after a freeze, burn a frozen account's public balance (1.0). A multisig is recommended. |
-| Role holder | Trusted for its permissions | Exactly the actions its `RoleEntry` allows, on that one mint: some of allowlist, block, unblock, freeze, thaw, pause, resume, seize and close seizure. It cannot change the rules, the meta list, the authorities or the roles, and it waits the same 24 hours as the admin before a seizure. It can give its own role up (`renounce_role`). A stolen role key can do what the role allows until the admin revokes it, so one role per person, each on a hardware key, with the fewest permissions that do the job. A handover of the policy ends every role (1.0). |
+| Policy authority (the admin) | Fully trusted for its mint | Change the rules and the lists, hand the policy over, rewrite the meta list, grant and take away roles. It can also stop every transfer of the mint (for example, allowlist on and empty). On a mint that gave Vigilantis its freeze authority, it can freeze any holder's token account, for as long as it likes (2.2), and hand the freeze authority to any address or give it up (2.3). On a mint that gave Vigilantis its pause authority and permanent delegate, it can pause the whole token and, 24 hours after a freeze, burn a frozen account's public balance (1.0). It is the only one who can release a forfeiture, and so the only way to thaw a forfeited account (1.0.0-rc.2). A multisig is recommended. |
+| Role holder | Trusted for its permissions | Exactly the actions its `RoleEntry` allows, on that one mint: some of allowlist, block, unblock, freeze, thaw, pause, resume, seize and close seizure. It cannot change the rules, the meta list, the authorities or the roles, and it waits the same 24 hours as the admin before a seizure or a forfeiture. With SEIZE it can forfeit an account, but never release a forfeiture. It can give its own role up (`renounce_role`). A stolen role key can do what the role allows until the admin revokes it, so one role per person, each on a hardware key, with the fewest permissions that do the job. A handover of the policy ends every role (1.0). |
 | Mint's transfer-hook authority | Fully trusted | Chosen when the mint is created (`createCompliantMint`'s `transferHookAuthority`, the provider wallet by default). It can point the mint at another hook program, or at none, with Token-2022 `UpdateTransferHook`, which switches every Vigilantis rule off and leaves no Vigilantis event. Give it to the issuer's multisig, or give it up so the hook can never change (Vigilantis can still be upgraded in place). `vigilantis status` shows it. |
 | Mint authority | Trusted at setup | Creates the policy and the meta list (so nobody else can claim a mint's policy first). Can mint to any account; minting does not run the hook. |
 | Mint's freeze authority | Trusted | Chosen when the mint is created. If it is Vigilantis's freeze address, only Vigilantis can freeze and thaw, and only for the policy authority. If it is anyone else (from the start, or after `set_freeze_authority`), Vigilantis cannot freeze at all, and that key freezes outside Vigilantis's rules and records; a `FreezeAuthorityChanged` event shows when it left Vigilantis. |
@@ -84,7 +94,7 @@ lives in the token account and a mint's paused state in the mint, both kept by T
 
 These must hold for every mint whose transfer hook is Vigilantis. The integration tests check each
 of them; the tests named here are in `tests/`. The model-based fuzz tests in `tests-fuzz/` check
-all fifteen together, after every step of random sequences of operations (see "How the invariants
+all sixteen together, after every step of random sequences of operations (see "How the invariants
 are tested" below).
 
 1. **Fail closed.** If the policy or the meta list is missing, every transfer of the mint fails.
@@ -92,9 +102,9 @@ are tested" below).
    (`admin.ts`)
 2. **Only the policy authority changes the rules.** `update_policy`, `propose_authority`,
    `cancel_authority_transfer`, `update_extra_account_meta_list`, `set_freeze_authority`,
-   `set_pause_authority` and the role instructions (except `renounce_role`) check
-   `has_one = authority` against the policy. The list, freeze, thaw, pause, resume, seize and
-   close-seizure instructions accept the policy authority or the holder of a role with the matching
+   `set_pause_authority`, `release_forfeiture` and the role instructions (except `renounce_role`)
+   check `has_one = authority` against the policy. The list, freeze, thaw, pause, resume, seize,
+   close-seizure and forfeit instructions accept the policy authority or the holder of a role with the matching
    permission, checked in the instruction by `authorize` (invariant 12). (`admin.ts`,
    `vigilantis.ts`, `roles-pause.ts`)
 3. **Only the mint authority creates a policy and a meta list**, so a stranger cannot set up
@@ -140,7 +150,9 @@ are tested" below).
     instructions emit neither. In 1.0 the same holds for `pause`, `resume`, `seize` and
     `close_seizure` (`EnforcementAction`; for a pause the wallet and token account are the default
     address), `set_pause_authority` (`PauseAuthorityChanged`), and the four role instructions
-    (`RoleChanged`, with the permissions before and after). (`enforcement.ts`, `roles-pause.ts`)
+    (`RoleChanged`, with the permissions before and after), and in 1.0.0-rc.2 for `forfeit` and
+    `release_forfeiture` (`EnforcementAction`; the release carries the case of its record).
+    (`enforcement.ts`, `roles-pause.ts`, `enforcement.rs`, `model.rs`)
 12. **A role does exactly what it says.** A signer other than the policy authority passes a gated
     instruction only with a `RoleEntry` owned by Vigilantis whose mint is the instruction's mint,
     whose holder is the signer, whose permissions include every bit the instruction needs, and
@@ -172,6 +184,15 @@ are tested" below).
     included, to a wallet the rules refuse, because Token-2022's `SetAuthority` on the account
     owner does not call the hook, and that wallet could spend from it and hand it on again. The
     check emits `TransferRefused` like any other rule. (`enforcement.ts`)
+16. **A forfeited account stays frozen until the admin releases it** (1.0.0-rc.2). `forfeit`
+    succeeds only if: the signer passes `authorize` (SEIZE); the case reference is not all zeros
+    (`InvalidCaseRef`, 6015); the mint's freeze authority is Vigilantis's freeze address (6008); the
+    token account belongs to the mint (6016) and is frozen (6012); and its `FreezeRecord` is at
+    least 24 hours old (`SeizeTooEarly`, 6014). It creates one `ForfeitureRecord` per token account
+    (a second `forfeit` fails) and moves nothing. While the record exists, `thaw_token_account`
+    refuses the account before touching it (`AccountForfeited`, 6020), whoever signs, the admin
+    included. Only `release_forfeiture`, which checks `has_one = authority` (never a role), removes
+    the record. (`enforcement.rs`, `model.rs`, `roles-pause.ts`)
 
 ## Known limits
 
@@ -220,10 +241,35 @@ These follow from how Token-2022 and transfer hooks work. They are documented, n
   was removed from the allowlist (or by `mint_to`) can still send them to allowlisted wallets.
   This lets holders exit; an issuer who wants otherwise also blocklists them.
 - **`u64::MAX` means "confidential".** A public transfer of exactly `u64::MAX` base units would be
-  read as confidential. It needs a supply of at least `u64::MAX`, so in practice it cannot happen.
+  read as confidential: refused on a mint with a limit, unless `allow_confidential` is on, in
+  which case it would pass the limit. It needs a supply of at least `u64::MAX`, so in practice it
+  cannot happen. The fuzz tests make such a supply in a few cases on purpose: it is how they check
+  the confidential limit rule through a real transfer, since LiteSVM cannot make a confidential
+  transfer's proofs.
 - **A confidential balance cannot be seized.** `seize` burns the public balance only; tokens held
   confidentially are encrypted, and burning them would need the holder's proof. They stay frozen
-  for as long as the account is frozen.
+  for as long as the account is frozen; `forfeit` (1.0.0-rc.2) makes that permanent and recorded
+  when the case ends. If the holder cooperates, the issuer can keep the wallet blocked, thaw the
+  account, let the holder `withdraw` the confidential balance to the public one (a withdrawal is
+  not a transfer, so the hook does not stop it; a transfer out still is), freeze it again and seize
+  it after another 24 hours.
+- **A forfeited balance stays in the supply.** `forfeit` moves and burns nothing; the program does
+  not know the amount, which only the auditor key shows. The issuer reports forfeited balances apart
+  from the supply in circulation. `amount_commitment` lets it commit to the amount on-chain without
+  showing it (for example SHA-256 of a salt and the amount); Vigilantis does not check it.
+- **Handing the freeze authority away gets round a forfeiture.** `thaw_token_account` checks the
+  forfeiture record, but after `set_freeze_authority` the new freeze authority thaws through
+  Token-2022 directly. Only the admin can do this, and it leaves a `FreezeAuthorityChanged` event.
+- **A forfeiture covers one token account.** Other accounts of the same wallet need their own; a
+  blocklist entry keeps the wallet from using new ones.
+- **A forfeiture does not stop a seizure.** `seize` thaws, burns and freezes again inside one
+  instruction, without `thaw_token_account`, so the issuer can still burn the public balance of a
+  forfeited account (normally it seizes that first and forfeits what is left). The account stays
+  frozen and keeps its forfeiture.
+- **Freezing, blocking and pausing never wait.** They take effect in the transaction that does
+  them, with or without a reason or a case reference, so an issuer can react to an exchange hack in
+  seconds. Only `seize` and `forfeit` wait the 24 hours after a freeze. A reason or case left out
+  cannot be added to the event later; the issuer's own register then notes the transaction.
 - **Seizure waits for a resume.** While the mint is paused, Token-2022 refuses the burn, so `seize`
   fails (`MintPaused`, 0x43). Freezing still works during a pause.
 - **A mint with `ConfidentialMintBurn` cannot be seized.** That extension makes Token-2022 refuse
@@ -242,7 +288,8 @@ These follow from how Token-2022 and transfer hooks work. They are documented, n
   frozen again through Vigilantis.
 - **Rent goes to whoever closes.** The signer of a freeze pays for the freeze record and the signer
   of the thaw gets it back, which may be a different role holder; the same for a seizure record and
-  `close_seizure`. The amounts are about 0.0015 and 0.0022 SOL.
+  `close_seizure`, and for a forfeiture record and `release_forfeiture` (always the admin). The
+  amounts are about 0.0015, 0.0022 and 0.0024 SOL.
 - **Mints set up before 2.1** do not check the transfer authority until the policy authority runs
   `update_extra_account_meta_list` once.
 - **A self-transfer never reaches the hook.** When the source and destination accounts are the
@@ -283,19 +330,20 @@ line, each finding reproduced before it was fixed.
 
 ## How the invariants are tested
 
-- **Integration tests** (`tests/`, 91 on a local validator with Token-2022 v11.1 and the ZK ElGamal
+- **Integration tests** (`tests/`, 96 on a local validator with Token-2022 v11.1 and the ZK ElGamal
   Proof Program): each rule, each instruction's authority checks, delegates, the handover, the
   meta-list update, events, setup with funded addresses, freezing and thawing (what a frozen
   account can no longer do, who may freeze, mints whose freeze authority is not Vigilantis's),
   handing the freeze authority on and giving it up, the enforcement record, and 12 tests with real
   confidential transfers where Token-2022 itself calls the hook, one of them to a frozen account,
-  and (1.0) roles, pause and the refusals of an early seizure through the SDK (`roles-pause.ts`),
-  and the `vigilantis` command line (`cli.ts`, 13), including the transactions it prints for a
+  and (1.0) roles, pause and the refusals of an early seizure and an early forfeiture through the
+  SDK (`roles-pause.ts`), and the `vigilantis` command line (`cli.ts`, 19), including the transactions it prints for a
   multisig, signed and sent the way the multisig would. Three more (`costs.ts`) measure what the hook costs a public, a delegated and a confidential
   transfer, and fail if that grows past the limits in the audit scope.
-- **Enforcement tests in LiteSVM** (`tests-fuzz/tests/enforcement.rs`, 11): a seizure needs the
-  clock 24 hours ahead, which a validator cannot do, so its success path, every refusal and the
-  role checks are tested here, with the clock moved.
+- **Enforcement tests in LiteSVM** (`tests-fuzz/tests/enforcement.rs`, 13): a seizure and a
+  forfeiture need the clock 24 hours ahead, which a validator cannot do, so their success paths,
+  every refusal, the refused thaws of a forfeited account and the role checks are tested here, with
+  the clock moved.
 - **Model-based fuzzing** (`tests-fuzz/`, in LiteSVM with the same Token-2022 build). Random
   sequences of every instruction, signed by the right authority or by someone else; freezes and
   thaws with reasons, on mints whose freeze authority is Vigilantis's address, the issuer or nobody,
@@ -305,22 +353,31 @@ line, each finding reproduced before it was fixed.
   amounts, with `u64::MAX` (confidential) and with made-up accounts; strangers funding the
   program's addresses before setup; and (1.0) roles granted, changed, revoked and renounced and used
   by their holders and by others, pauses and resumes, the pause authority handed on, seizures and
-  their closing, and the clock moved forward (one hour, 12 hours, one second short of 24 hours,
+  their closing, (1.0.0-rc.2) forfeitures, thaws of forfeited accounts and releases by the admin and
+  by others, and the clock moved forward (one hour, 12 hours, one second short of 24 hours,
 exactly 24 hours, about 28 hours). A plain Rust model of the rules predicts each outcome, down to
   the exact error code, and after every step the test compares the whole state with the model: the
   policy, every entry, a pending handover, balances, delegations, which accounts are frozen, the
   mint's freeze authority, the meta list's bytes, the total supply, every role entry, the pause
-  state, every freeze record and every open seizure. It also decodes every `EnforcementAction` and
+  state, every freeze record, every open seizure and every forfeiture, and that a forfeited account
+  is frozen. It also decodes every `EnforcementAction` and
   `FreezeAuthorityChanged` a step emitted and compares them with the
   model, field by field. CI runs a
   new random set of cases on every push; a failure prints the seed that reproduces it.
 - **Is the fuzzing strong enough?** It found finding 8 on the 2.1.0 build. We also broke the
-  program on purpose in 70 ways (a dropped authority check, a rule switched off, an off-by-one, a
+  program on purpose in 79 ways (a dropped authority check, a rule switched off, an off-by-one, a
   freeze recorded with the wrong action or reason, a role that works for another mint, a seizure a
-  second too early or one base unit short), and the fuzz tests catch all 70. Four of the 1.0
+  second too early or one base unit short, a thaw that ignores a forfeiture), and the fuzz tests
+  catch all 79. Two of the 70 written for 1.0.0-rc.1 no longer matched the program after finding
+  11, so `mutants.py` stopped before running any, and nobody noticed that two others had become
+  uncatchable: since finding 10 the hook refuses a direct `Execute`, the only way the fuzz tests
+  reached them. 1.0.0-rc.2 repairs the first two, drops `any-block-entry-blocks`, which now
+  behaves exactly like the program (Token-2022 passes the authority's block entry at its derived
+  address, so its content check cannot fail), and catches `confidential-limit-ignored` through a
+  public transfer of the whole supply (below). Four of the 1.0
   mutants were caught only in some runs at first, which led to changes in what the generator
-  tries. The fuzz tests execute 986 of the 1,025 lines of `lib.rs` that carry code (96.2%); the
-  other 39 are listed with the reason, and the paths among them that can be reached at all are
+  tries. On 29 October, before 1.0.0-rc.1, the fuzz tests executed 986 of the 1,025 lines of
+  `lib.rs` that carry code (96.2%); the other 39 are listed with the reason, and the paths among them that can be reached at all are
   tested in `enforcement.rs`. Both are in `tests-fuzz/README.md`.
 - **CI** also runs `cargo clippy -D warnings`, `cargo audit`, a check that the committed IDL matches
   the program, a check of the security.txt embedded in the program, and the verified build

@@ -102,8 +102,10 @@ MUTANTS = [
     ("blocklist-flag-ignored", replace("if policy.blocklist_enabled {", "if true {")),
     ("allowlist-off", replace("if policy.allowlist_enabled && !is_active(",
                               "if false && policy.allowlist_enabled && !is_active(")),
-    ("any-block-entry-blocks", replace("Ok(entry) => entry.mint == *mint && entry.wallet == *wallet,",
-                                       "Ok(_) => true,")),
+    # `any-block-entry-blocks` (the transfer authority's block entry blocks whatever its mint and
+    # wallet) was dropped in 1.0.0-rc.2: since 1.0.0-rc.1 the hook runs only inside a Token-2022
+    # transfer, which passes that entry at its derived address, so the content check cannot fail
+    # and the mutant behaves exactly like the program. The check stays as defence in depth.
     ("rules-in-wrong-order", replace(
         "        if is_active(&ctx.accounts.source_block, ctx.program_id) {\n            return Err(VigilantisError::SenderBlocked);\n        }\n        if is_active(&ctx.accounts.dest_block, ctx.program_id) {\n            return Err(VigilantisError::RecipientBlocked);\n        }",
         "        if is_active(&ctx.accounts.dest_block, ctx.program_id) {\n            return Err(VigilantisError::RecipientBlocked);\n        }\n        if is_active(&ctx.accounts.source_block, ctx.program_id) {\n            return Err(VigilantisError::SenderBlocked);\n        }")),
@@ -162,7 +164,9 @@ MUTANTS = [
         "constraint = mint.freeze_authority == COption::Some(freeze_authority.key())",
         "constraint = true")),
     ("freeze-authority-to-vigilantis-allowed", in_function(
-        "set_freeze_authority", "new != Pubkey::default() && new != vigilantis", "new != Pubkey::default()")),
+        "set_freeze_authority",
+        "new != Pubkey::default() && !is_vigilantis_address(&ctx.accounts.mint.key(), &new)",
+        "new != Pubkey::default()")),
     ("freeze-authority-change-recorded-wrong", replace(
         "            new_freeze_authority,\n            reason_code,\n",
         "            new_freeze_authority: None,\n            reason_code,\n")),
@@ -191,16 +195,19 @@ MUTANTS = [
         "true")),
     ("set-pause-authority-anyone", drop_has_one("SetPauseAuthority")),
     ("pause-authority-to-vigilantis-allowed", in_function(
-        "set_pause_authority", "new != Pubkey::default() && new != vigilantis", "new != Pubkey::default()")),
+        "set_pause_authority",
+        "new != Pubkey::default() && !is_vigilantis_address(&ctx.accounts.mint.key(), &new)",
+        "new != Pubkey::default()")),
     ("pause-recorded-as-resume", replace(
         "emit_paused(&ctx, EnforcementKind::Pause, reason_code, case_ref);",
         "emit_paused(&ctx, EnforcementKind::Resume, reason_code, case_ref);")),
     # Seizure (1.0).
     ("seize-anyone", skip_authorize("seize")),
-    ("seize-delay-off", replace("            clock.unix_timestamp >= earliest,", "            true,")),
-    ("seize-delay-off-by-one", replace("            clock.unix_timestamp >= earliest,",
-                                       "            clock.unix_timestamp > earliest,")),
-    ("seize-without-case-ref", replace("        require!(case_ref != [0u8; 32], VigilantisError::InvalidCaseRef);\n", "")),
+    ("seize-delay-off", in_function("seize", "            clock.unix_timestamp >= earliest,", "            true,")),
+    ("seize-delay-off-by-one", in_function("seize", "            clock.unix_timestamp >= earliest,",
+                                           "            clock.unix_timestamp > earliest,")),
+    ("seize-without-case-ref", in_function(
+        "seize", "        require!(case_ref != [0u8; 32], VigilantisError::InvalidCaseRef);\n", "")),
     ("seize-delegate-check-off", replace(
         "mint_extension_address(&data, EXTENSION_PERMANENT_DELEGATE) == Some(delegate),", "true,")),
     ("seize-burns-one-less", in_function("seize", "            amount,\n        )?;", "            amount - 1,\n        )?;")),
@@ -221,6 +228,26 @@ MUTANTS = [
     ("freeze-record-not-written", replace("        write_freeze_record(&ctx)?;\n", "")),
     ("thaw-keeps-freeze-record", replace("        close_freeze_record(&ctx)?;\n", "")),
     ("close-seizure-anyone", skip_authorize("close_seizure")),
+    # Forfeiture (1.0.0-rc.2).
+    ("forfeit-anyone", skip_authorize("forfeit")),
+    ("forfeit-with-thaw-permission", in_function("forfeit", "permission::SEIZE", "permission::THAW")),
+    ("forfeit-delay-off", in_function("forfeit", "            clock.unix_timestamp >= earliest,", "            true,")),
+    ("forfeit-delay-off-by-one", in_function("forfeit", "            clock.unix_timestamp >= earliest,",
+                                             "            clock.unix_timestamp > earliest,")),
+    ("forfeit-without-case-ref", in_function(
+        "forfeit", "        require!(case_ref != [0u8; 32], VigilantisError::InvalidCaseRef);\n", "")),
+    ("forfeit-freeze-authority-check-off", in_struct(
+        "Forfeit",
+        "constraint = mint.freeze_authority == COption::Some(freeze_authority.key())",
+        "constraint = true")),
+    ("forfeit-recorded-as-seize", in_function(
+        "forfeit", "            action: EnforcementKind::Forfeit,", "            action: EnforcementKind::Seize,")),
+    ("thaw-ignores-forfeiture", replace("        require_not_forfeited(&ctx)?;\n", "")),
+    ("release-forfeiture-anyone", drop_has_one("ReleaseForfeiture")),
+    ("release-recorded-without-case", in_function(
+        "release_forfeiture",
+        "            action: EnforcementKind::ReleaseForfeiture,\n            reason_code,\n            case_ref: record.case_ref,",
+        "            action: EnforcementKind::ReleaseForfeiture,\n            reason_code,\n            case_ref: [0; 32],")),
 ]
 
 

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 //
-// Vigilantis 1.0: roles, pause and the first half of seizure, through the SDK on a local validator.
-// A seizure itself needs the clock 24 hours ahead, which a validator cannot do, so its success path
-// is tested in LiteSVM (tests-fuzz/tests/enforcement.rs); here it must be refused as too early.
+// Vigilantis 1.0: roles, pause and the first half of seizure and forfeiture, through the SDK on a
+// local validator. Both need the clock 24 hours ahead, which a validator cannot do, so their success
+// paths are tested in LiteSVM (tests-fuzz/tests/enforcement.rs); here they must be refused as too
+// early.
 import * as anchor from "@coral-xyz/anchor";
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
@@ -22,7 +23,14 @@ import {
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import { assert } from "chai";
-import { ENFORCEMENT_REASONS, PERMISSIONS, SEIZE_DELAY_SECONDS, VigilantisClient, caseRef } from "../sdk/src";
+import {
+  ENFORCEMENT_REASONS,
+  PERMISSIONS,
+  SEIZE_DELAY_SECONDS,
+  VigilantisClient,
+  amountCommitment,
+  caseRef,
+} from "../sdk/src";
 
 const CONFIRM = { commitment: "confirmed" as const };
 const SALT = "test-salt-not-for-production";
@@ -138,6 +146,52 @@ describe("vigilantis — roles, pause, seizure (SDK)", () => {
     }
     assert.isTrue(threw, "a zero case reference must be refused before sending");
     assert.isNull(await admin.getSeizure(mint.publicKey, ata(alice.publicKey), caseRef("CASE-9", SALT)));
+  });
+
+  it("refuses a forfeiture before the 24 hours are up, one without a case, and one by a role without SEIZE", async () => {
+    const commitment = amountCommitment(1_000n, "amount-salt-not-for-production");
+    const tooEarly = await failure(() =>
+      admin.forfeit(mint.publicKey, ata(alice.publicKey), reason(ENFORCEMENT_REASONS.courtOrder, "CASE-9"), commitment),
+    );
+    assert.match(tooEarly, /SeizeTooEarly/);
+    const noSeize = await failure(() =>
+      asOfficer.forfeit(mint.publicKey, ata(alice.publicKey), reason(ENFORCEMENT_REASONS.courtOrder, "CASE-9")),
+    );
+    assert.match(noSeize, /Unauthorized/);
+    let threw = false;
+    try {
+      await admin.forfeitInstruction({
+        mint: mint.publicKey,
+        tokenAccount: ata(alice.publicKey),
+        enforcement: { reasonCode: 2, caseRef: new Uint8Array(32) },
+      });
+    } catch {
+      threw = true;
+    }
+    assert.isTrue(threw, "a zero case reference must be refused before sending");
+    // An account Vigilantis never froze has no freeze record to wait from.
+    const neverFrozen = await failure(() =>
+      admin.forfeit(mint.publicKey, ata(bob.publicKey), reason(ENFORCEMENT_REASONS.courtOrder, "CASE-9")),
+    );
+    assert.match(neverFrozen, /AccountNotInitialized|3012/);
+    assert.isNull(await admin.getForfeiture(mint.publicKey, ata(alice.publicKey)));
+    assert.deepEqual(await admin.listForfeitures(mint.publicKey), []);
+    assert.equal((await admin.forfeitedAmong(mint.publicKey, [ata(alice.publicKey), ata(bob.publicKey)])).size, 0);
+    // Releasing what is not forfeited fails.
+    assert.match(
+      await failure(() => admin.releaseForfeiture(mint.publicKey, ata(alice.publicKey), ENFORCEMENT_REASONS.caseClosed)),
+      /AccountNotInitialized|3012/,
+    );
+  });
+
+  it("commits to an amount the same way every time, and differently for another amount or salt", () => {
+    const a = amountCommitment(1_000n, "amount-salt-not-for-production");
+    assert.equal(a.length, 32);
+    assert.deepEqual(a, amountCommitment(1000, "amount-salt-not-for-production"));
+    assert.notDeepEqual(a, amountCommitment(1_001n, "amount-salt-not-for-production"));
+    assert.notDeepEqual(a, amountCommitment(1_000n, "another-amount-salt-for-tests"));
+    assert.throws(() => amountCommitment(-1n, "amount-salt-not-for-production"));
+    assert.throws(() => amountCommitment(1n << 64n, "amount-salt-not-for-production"));
   });
 
   it("thaws (admin) and deletes the freeze record", async () => {

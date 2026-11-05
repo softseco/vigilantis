@@ -727,3 +727,215 @@ fn a_freeze_record_left_by_a_thaw_outside_vigilantis() {
     assert_eq!(custom_code(&err), Some(code::SEIZE_TOO_EARLY));
     assert_eq!(token_state(&s.svm, &account).0, 500);
 }
+
+/// Forfeiture (1.0.0-rc.2): a case ends with the balance out of reach, typically a confidential
+/// one, so the account stays frozen for good. `forfeit` waits 24 hours after the freeze like
+/// `seize`, needs a case, and from then on `thaw_token_account` refuses the account, the admin's
+/// thaw included, until the admin (never a role) releases the forfeiture.
+#[test]
+fn a_forfeited_account_cannot_be_thawed_until_the_admin_releases_it() {
+    let mut s = setup();
+    s.grant(perm::SEIZE | perm::THAW | perm::FREEZE);
+    let (mint, account, officer) = (s.mint, s.account, s.officer.pubkey());
+    let issuer = s.issuer.insecure_clone();
+    let commitment = [9u8; 32];
+
+    // Not frozen: there is no freeze record.
+    let err = s
+        .as_officer(ix::forfeit(officer, mint, account, reason(2), commitment))
+        .unwrap_err();
+    assert_eq!(
+        custom_code(&err),
+        Some(anchor_code::ACCOUNT_NOT_INITIALIZED)
+    );
+
+    s.freeze();
+    // Too early, for the admin as for everyone.
+    let err = send(
+        &mut s.svm,
+        &issuer,
+        &[],
+        &[ix::forfeit(
+            issuer.pubkey(),
+            mint,
+            account,
+            reason(2),
+            commitment,
+        )],
+    )
+    .unwrap_err();
+    assert_eq!(custom_code(&err), Some(code::SEIZE_TOO_EARLY));
+    advance_clock(&mut s.svm, SEIZE_DELAY_SECONDS);
+
+    // A forfeiture needs a case reference.
+    let zero = Reason {
+        code: 2,
+        case_ref: [0; 32],
+    };
+    let err = s
+        .as_officer(ix::forfeit(officer, mint, account, zero, commitment))
+        .unwrap_err();
+    assert_eq!(custom_code(&err), Some(code::INVALID_CASE_REF));
+
+    // The officer forfeits. Nothing is burnt; the account stays frozen with its balance.
+    let supply = supply_of(&s.svm, &mint);
+    let logs = s
+        .as_officer(ix::forfeit(officer, mint, account, reason(2), commitment))
+        .expect("forfeit");
+    assert!(is_frozen(&s.svm, &account));
+    assert_eq!(token_state(&s.svm, &account).0, 500);
+    assert_eq!(supply_of(&s.svm, &mint), supply);
+    assert_eq!(
+        read_forfeiture(&s.svm, &mint, &account),
+        Some((CASE, commitment, officer))
+    );
+    let events = enforcement_events(&logs);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].action, Action::Forfeit);
+    assert_eq!(events[0].wallet, s.holder.pubkey());
+    assert_eq!(events[0].token_account, account);
+    assert_eq!(events[0].reason, reason(2));
+
+    // A second forfeiture of the same account fails: its record exists.
+    assert!(s
+        .as_officer(ix::forfeit(officer, mint, account, reason(2), commitment))
+        .is_err());
+
+    // Nobody can thaw it now: not the officer with THAW, not the admin.
+    let err = s
+        .as_officer(ix::set_frozen(false, officer, mint, account, reason(7)))
+        .unwrap_err();
+    assert_eq!(custom_code(&err), Some(code::ACCOUNT_FORFEITED));
+    let err = send(
+        &mut s.svm,
+        &issuer,
+        &[],
+        &[ix::set_frozen(
+            false,
+            issuer.pubkey(),
+            mint,
+            account,
+            reason(7),
+        )],
+    )
+    .unwrap_err();
+    assert_eq!(custom_code(&err), Some(code::ACCOUNT_FORFEITED));
+    assert!(is_frozen(&s.svm, &account));
+
+    // The public balance can still be seized.
+    s.seize_by_issuer().expect("seize the public part");
+    assert_eq!(token_state(&s.svm, &account).0, 0);
+    assert!(is_frozen(&s.svm, &account));
+
+    // Only the admin releases the forfeiture, with no role at all.
+    let officer_kp = s.officer.insecure_clone();
+    let err = send(
+        &mut s.svm,
+        &officer_kp,
+        &[],
+        &[ix::release_forfeiture(officer, mint, account, 7)],
+    )
+    .unwrap_err();
+    assert_eq!(custom_code(&err), Some(code::UNAUTHORIZED));
+    let logs = send_logs(
+        &mut s.svm,
+        &issuer,
+        &[],
+        &[ix::release_forfeiture(issuer.pubkey(), mint, account, 7)],
+    )
+    .expect("release_forfeiture");
+    assert_eq!(read_forfeiture(&s.svm, &mint, &account), None);
+    let events = enforcement_events(&logs);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].action, Action::ReleaseForfeiture);
+    assert_eq!(events[0].reason.case_ref, CASE);
+    assert_eq!(events[0].reason.code, 7);
+    // Still frozen until a thaw, which works again.
+    assert!(is_frozen(&s.svm, &account));
+    s.as_officer(ix::set_frozen(false, officer, mint, account, reason(7)))
+        .expect("thaw after the release");
+    assert!(!is_frozen(&s.svm, &account));
+}
+
+#[test]
+fn forfeit_needs_the_seize_permission_a_frozen_account_and_vigilantis_freeze_authority() {
+    let mut s = setup();
+    s.grant(perm::FREEZE | perm::THAW | perm::CLOSE_SEIZURE);
+    let (mint, account, officer) = (s.mint, s.account, s.officer.pubkey());
+    let issuer = s.issuer.insecure_clone();
+    s.freeze();
+    advance_clock(&mut s.svm, SEIZE_DELAY_SECONDS);
+
+    // Without SEIZE: refused.
+    let err = s
+        .as_officer(ix::forfeit(officer, mint, account, reason(2), [0; 32]))
+        .unwrap_err();
+    assert_eq!(custom_code(&err), Some(code::UNAUTHORIZED));
+
+    // A record whose account was thawed outside Vigilantis: the account is not frozen.
+    send(
+        &mut s.svm,
+        &issuer,
+        &[],
+        &[ix::set_freeze_authority(
+            issuer.pubkey(),
+            mint,
+            Some(issuer.pubkey()),
+            reason(0),
+        )],
+    )
+    .expect("hand the freeze authority to the issuer");
+    // While the freeze authority is not Vigilantis's, forfeit is refused outright.
+    let err = send(
+        &mut s.svm,
+        &issuer,
+        &[],
+        &[ix::forfeit(
+            issuer.pubkey(),
+            mint,
+            account,
+            reason(2),
+            [0; 32],
+        )],
+    )
+    .unwrap_err();
+    assert_eq!(
+        custom_code(&err),
+        Some(code::FREEZE_AUTHORITY_NOT_VIGILANTIS)
+    );
+    let thaw = spl_token_2022_interface::instruction::thaw_account(
+        &TOKEN_2022_ID,
+        &account,
+        &mint,
+        &issuer.pubkey(),
+        &[],
+    )
+    .unwrap();
+    send(&mut s.svm, &issuer, &[], &[thaw]).expect("thaw outside Vigilantis");
+    send(
+        &mut s.svm,
+        &issuer,
+        &[],
+        &[set_freeze_authority_ix(
+            &mint,
+            &issuer.pubkey(),
+            &freeze_authority_pda(&mint),
+        )],
+    )
+    .expect("hand it back");
+    let err = send(
+        &mut s.svm,
+        &issuer,
+        &[],
+        &[ix::forfeit(
+            issuer.pubkey(),
+            mint,
+            account,
+            reason(2),
+            [0; 32],
+        )],
+    )
+    .unwrap_err();
+    assert_eq!(custom_code(&err), Some(code::ACCOUNT_NOT_FROZEN));
+    assert_eq!(read_forfeiture(&s.svm, &mint, &account), None);
+}

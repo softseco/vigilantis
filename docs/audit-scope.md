@@ -1,13 +1,13 @@
 # Vigilantis: audit scope
 
 Prepared on 17 October 2026 for Vigilantis's first independent audit, updated on 29 October
-for the 1.0 enforcement functions (roles, pause, seizure) and on 2 November after a second review
-of our own. Vigilantis is self-audited, not
-independently audited. The code under audit is the commit tagged `v1.0.0-rc.1` in the public
+for the 1.0 enforcement functions (roles, pause, seizure), on 2 November after a second review
+of our own, and on 5 November for forfeiture (1.0.0-rc.2). Vigilantis is self-audited, not
+independently audited. The code under audit is the commit tagged `v1.0.0-rc.2` in the public
 `vigilantis` repository, which this document describes.
 
 The threat model ([threat-model.md](./threat-model.md)) is the companion to this page: who is
-trusted, the fifteen invariants and the tests that check them, the known limits, the findings of our
+trusted, the sixteen invariants and the tests that check them, the known limits, the findings of our
 own review, and the questions we would like answered. This page says what to read, how to build and
 test it, and what it costs.
 
@@ -15,7 +15,7 @@ test it, and what it costs.
 
 | Path | What |
 |---|---|
-| `programs/vigilantis/src/lib.rs` | The whole program, in one file: 2,466 lines, about 1,900 of them code (without blank lines and comments). |
+| `programs/vigilantis/src/lib.rs` | The whole program, in one file: 2,743 lines, about 2,100 of them code (without blank lines and comments). |
 | `programs/vigilantis/Cargo.toml`, `Cargo.lock` | Dependencies and their exact versions. |
 
 Built with Anchor 0.31.1 (`anchor-lang` and `anchor-spl` 0.31.1) on `solana-program` 2.3.0. The
@@ -54,7 +54,7 @@ and on devnet from its first deployment there. Sentinel 2.1.0, the earlier name,
 | `add_to_allowlist`, `remove_from_allowlist` | policy authority, or a role with ALLOWLIST | Create or close an `AllowEntry`. |
 | `add_to_blocklist`, `remove_from_blocklist` | policy authority, or a role with BLOCK / UNBLOCK | Create or close a `BlockEntry`. |
 | `block_wallet`, `unblock_wallet` | policy authority, or a role with BLOCK / UNBLOCK | The same as the blocklist pair, with a reason code and case reference in an `EnforcementAction` event. |
-| `freeze_token_account`, `thaw_token_account` | policy authority, or a role with FREEZE / THAW | Token-2022 `FreezeAccount` / `ThawAccount`, signed by the mint's freeze address; writes or deletes the `FreezeRecord`; `EnforcementAction` event. |
+| `freeze_token_account`, `thaw_token_account` | policy authority, or a role with FREEZE / THAW | Token-2022 `FreezeAccount` / `ThawAccount`, signed by the mint's freeze address; writes or deletes the `FreezeRecord`; `EnforcementAction` event. A thaw is refused while the account has a `ForfeitureRecord` (`AccountForfeited`), whoever signs. |
 | `set_freeze_authority` | policy authority | Token-2022 `SetAuthority` (freeze) from the freeze address to another address or to none; `FreezeAuthorityChanged` event. |
 | `grant_role`, `update_role`, `revoke_role` | policy authority | Create, change or close a `RoleEntry`; `RoleChanged` event. |
 | `renounce_role` | the role holder | Closes its own `RoleEntry`; `RoleChanged` event. |
@@ -62,6 +62,8 @@ and on devnet from its first deployment there. Sentinel 2.1.0, the earlier name,
 | `set_pause_authority` | policy authority | Token-2022 `SetAuthority` (pause) from the pause address to another address or to none; `PauseAuthorityChanged` event. |
 | `seize` | policy authority, or a role with SEIZE | On an account frozen through Vigilantis at least 24 hours before: Token-2022 `ThawAccount`, `Burn` of the whole public balance signed by the mint's permanent-delegate address, `FreezeAccount`; creates a `SeizureRecord`; `EnforcementAction` and `Seized` events. |
 | `close_seizure` | policy authority, or a role with CLOSE_SEIZURE | Closes a `SeizureRecord` with its outcome; `EnforcementAction` and `SeizureClosed` events. |
+| `forfeit` (1.0.0-rc.2) | policy authority, or a role with SEIZE | On an account frozen through Vigilantis at least 24 hours before, with a case reference: creates a `ForfeitureRecord` (reason, case, an optional 32-byte commitment to the amount). Calls no Token-2022 instruction and moves nothing; `EnforcementAction` and `Forfeited` events. |
+| `release_forfeiture` (1.0.0-rc.2) | policy authority only | Closes a `ForfeitureRecord`, so the account can be thawed; `EnforcementAction` (with the record's case) and `ForfeitureReleased` events. |
 | `propose_authority`, `cancel_authority_transfer` | policy authority | Open or close a `PendingAuthority`. |
 | `accept_authority` | the proposed authority | Completes the handover; the pending account's rent goes back to the previous authority. |
 | `transfer_hook` (and `fallback`, which routes Token-2022's `Execute` to it) | nobody: Token-2022 calls it during a transfer | Refuses a call outside a transfer (`NotInTransfer`) and token accounts whose owner can change (`OwnerCanChange`), then applies the rules. Reads accounts, writes nothing. |
@@ -79,6 +81,7 @@ and on devnet from its first deployment there. Sentinel 2.1.0, the earlier name,
 | `RoleEntry` | `["role", mint, holder]` | One role holder's permission bits. |
 | `FreezeRecord` | `["freeze-record", mint, token_account]` | When Vigilantis last froze the account. |
 | `SeizureRecord` | `["seizure", mint, token_account, case_ref]` | One open seizure: the owner, the amount burnt, the reason, who seized and when. |
+| `ForfeitureRecord` | `["forfeiture", mint, token_account]` | One forfeited account: the owner, the reason, the case, the amount commitment, who forfeited and when. |
 | Pause address | `["pause-authority", mint]` | Nothing. It signs as the mint's pause authority. |
 | Permanent-delegate address | `["permanent-delegate", mint]` | Nothing. It signs as the mint's permanent delegate, only in `seize`. |
 
@@ -91,7 +94,7 @@ authority's block entry as the fifth extra account (2.1), which it also checks b
 Events: `PolicyInitialized`, `PolicyUpdated`, `ListEntryAdded`, `ListEntryRemoved`,
 `MetaListUpdated`, `AuthorityTransferProposed`, `AuthorityTransferCancelled`,
 `AuthorityTransferred`, `EnforcementAction`, `FreezeAuthorityChanged`, `TransferRefused`,
-`PauseAuthorityChanged`, `Seized`, `SeizureClosed`, `RoleChanged`.
+`PauseAuthorityChanged`, `Seized`, `SeizureClosed`, `Forfeited`, `ForfeitureReleased`, `RoleChanged`.
 
 Errors: 6000 `RecipientNotAllowlisted`, 6001 `TransferExceedsLimit`, 6002 `SenderBlocked`,
 6003 `RecipientBlocked`, 6004 `Unauthorized`, 6005 `ConfidentialAmountNotEnforceable`,
@@ -99,7 +102,7 @@ Errors: 6000 `RecipientNotAllowlisted`, 6001 `TransferExceedsLimit`, 6002 `Sende
 6009 `InvalidPermissions`, 6010 `PauseAuthorityNotVigilantis`, 6011
 `PermanentDelegateNotVigilantis`, 6012 `AccountNotFrozen`, 6013 `NothingToSeize`, 6014
 `SeizeTooEarly`, 6015 `InvalidCaseRef`, 6016 `InvalidTokenAccount`, 6017 `NotInTransfer`,
-6018 `OwnerCanChange`, 6019 `PausedMintHandover`.
+6018 `OwnerCanChange`, 6019 `PausedMintHandover`, 6020 `AccountForfeited`.
 
 ### Calls to other programs
 
@@ -121,11 +124,11 @@ Node 22. The tests need Agave 4.x because older validators reject today's ZK pro
 |---|---|
 | Build | `anchor build --no-idl` (or `cargo build-sbf --manifest-path programs/vigilantis/Cargo.toml`) |
 | Check the embedded security.txt | `bash scripts/check-security-txt.sh` |
-| Integration tests (91, local validator, Token-2022 v11.1.0 from `tests/fixtures`) | `anchor test --skip-build` |
+| Integration tests (96, local validator, Token-2022 v11.1.0 from `tests/fixtures`) | `anchor test --skip-build` |
 | Verified build (Docker) and its hash | `solana-verify build --library-name vigilantis`, then `solana-verify get-executable-hash target/deploy/vigilantis.so` |
-| Roles, pause and seizure in LiteSVM, with the clock moved for the 24-hour delay (11) | `cd tests-fuzz && cargo test --test enforcement` |
+| Roles, pause, seizure and forfeiture in LiteSVM, with the clock moved for the 24-hour delay (13) | `cd tests-fuzz && cargo test --test enforcement` |
 | Fuzz tests against a model (LiteSVM) | `cd tests-fuzz && cargo test --test model` (`FUZZ_CASES`, `FUZZ_STEPS`, `FUZZ_SEED`) |
-| Planted bugs the fuzz tests must catch (70) | `python3 tests-fuzz/mutants.py` |
+| Planted bugs the fuzz tests must catch (79) | `python3 tests-fuzz/mutants.py` |
 | Line coverage under fuzzing | `bash tests-fuzz/coverage.sh` |
 | Integration and fuzz tests against the Token-2022 on mainnet | `bash scripts/mainnet-token-2022.sh` (CI runs it weekly) |
 
@@ -141,21 +144,23 @@ the same way on another machine must give the same hash, and so must
 
 ## What the hook costs a transfer
 
-Measured on 17 October 2026 by `tests/costs.ts` on a local validator (Agave 4.2.2, Token-2022
-v11.1.0), with every rule on: allowlist, blocklist, a limit and `allow_confidential`.
+Measured on 5 November 2026 (1.0.0-rc.2) by `tests/costs.ts` on a local validator (Agave 4.2.2,
+Token-2022 v11.1.0), with every rule on: allowlist, blocklist, a limit and `allow_confidential`.
+The fixed part grew by about 250 CU from 17 October (2.3.0) with the two checks 1.0.0-rc.1 added
+to the hook (`NotInTransfer`, `OwnerCanChange`); forfeiture adds nothing to a transfer.
 
 | Transfer | Vigilantis CU, fixed part | Transaction bytes | Bytes left of 1232 |
 |---|---:|---:|---:|
-| Public, signed by the owner | 7,672 | 478 | 754 |
-| Public, signed by a delegate | 7,865 | 510 | 722 |
-| Confidential, signed by the owner (the transaction with Token-2022's `Transfer`) | 7,335 | 792 | 440 |
+| Public, signed by the owner | 7,922 | 478 | 754 |
+| Public, signed by a delegate | 8,115 | 510 | 722 |
+| Confidential, signed by the owner (the transaction with Token-2022's `Transfer`) | 7,584 | 792 | 440 |
 
 On top of the fixed part, the hook pays for finding the meta list's bump. Anchor checks the meta
 list's address with `find_program_address`, which tries bumps from 255 down at 1,500 CU a try, so
 a mint whose meta-list address has bump 255 − k costs 1,500 × k more on every transfer. About half
 of all mints need no extra try, a quarter one, an eighth two, and so on. Three runs with different
 mints measured 1,500, 4,500 and 7,500 CU of extra tries, and the fixed part stayed exactly the
-same. Whole transactions used 39,000–73,000 CU, most of it Token-2022's and, for the confidential
+same. Whole transactions used 36,000–73,000 CU, most of it Token-2022's and, for the confidential
 transfer, the closing of its proof accounts. The threat model asks the auditor whether the hook
 needs this address check at all.
 
@@ -177,7 +182,8 @@ Planned for mainnet, not done yet:
   permanent-delegate address). Neither extension can be added after the mint is created. Explorers
   show that a mint has a permanent delegate.
 - **Roles:** one role per compliance officer, each on its own hardware key; the admin, a multisig,
-  keeps everything a single key should not do alone.
+  keeps everything a single key should not do alone, and is the only one who can release a
+  forfeiture.
 
 The deployment plan, with the multisig set-up, deploying and upgrading through it, the verified
 build and the emergency procedures, is in [deployment.md](./deployment.md).

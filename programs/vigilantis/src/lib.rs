@@ -42,6 +42,10 @@
 //!     [`SEIZE_DELAY_SECONDS`] earlier, refreezes it, and keeps a `SeizureRecord` until
 //!     `close_seizure`. Vigilantis never moves value to anyone. A confidential balance cannot be
 //!     seized, because moving it needs proofs only its owner can make; freezing is the tool there.
+//!   - **forfeiture** (1.0.0-rc.2): when a case ends and the balance could not be seized (above all a
+//!     confidential one), `forfeit` keeps a `ForfeitureRecord` for the frozen account, and
+//!     `thaw_token_account` refuses it for as long as the record exists. Only the admin can remove
+//!     it, with `release_forfeiture`.
 //!
 //! The transfer hook never reads roles, so transfers cost the same as before, and a mint without
 //! role entries, Pausable or a permanent delegate behaves as in Sentinel 2.3.
@@ -91,6 +95,8 @@ const PERMANENT_DELEGATE_SEED: &[u8] = b"permanent-delegate";
 const FREEZE_RECORD_SEED: &[u8] = b"freeze-record";
 /// An open seizure: `["seizure", mint, token_account, case_ref]`.
 const SEIZURE_SEED: &[u8] = b"seizure";
+/// A token account frozen for good at the end of a case: `["forfeiture", mint, token_account]`.
+const FORFEITURE_SEED: &[u8] = b"forfeiture";
 
 /// How long a token account must have been frozen through Vigilantis before `seize` can burn its
 /// public balance: 24 hours, for everyone, the admin included. The time counts from the latest
@@ -115,7 +121,7 @@ pub mod permission {
     pub const PAUSE: u16 = 1 << 5;
     /// `resume`.
     pub const RESUME: u16 = 1 << 6;
-    /// `seize`.
+    /// `seize` and `forfeit`.
     pub const SEIZE: u16 = 1 << 7;
     /// `close_seizure`.
     pub const CLOSE_SEIZURE: u16 = 1 << 8;
@@ -471,7 +477,8 @@ pub mod vigilantis {
 
     /// Thaw a token account frozen with `freeze_token_account` (or by any earlier holder of the
     /// mint's freeze authority). The admin, or a holder of `permission::THAW`. Deletes the
-    /// account's `FreezeRecord`, if there is one, and returns its rent to the signer.
+    /// account's `FreezeRecord`, if there is one, and returns its rent to the signer. Refused while
+    /// the account has a `ForfeitureRecord` (`AccountForfeited`), the admin's thaw included.
     pub fn thaw_token_account(
         ctx: Context<SetFrozen>,
         reason_code: u16,
@@ -483,6 +490,7 @@ pub mod vigilantis {
             &ctx.accounts.role,
             permission::THAW,
         )?;
+        require_not_forfeited(&ctx)?;
         set_frozen(&ctx, false)?;
         close_freeze_record(&ctx)?;
         emit_frozen(&ctx, EnforcementKind::Thaw, reason_code, case_ref);
@@ -749,6 +757,121 @@ pub mod vigilantis {
             amount: record.amount,
             case_ref: record.case_ref,
             outcome,
+            reason_code,
+            authority,
+        });
+        Ok(())
+    }
+
+    /// End a case whose funds cannot be seized: the token account stays frozen for good. The
+    /// admin, or a holder of `permission::SEIZE`; `case_ref` must not be all zeros.
+    ///
+    /// This is for a balance that `seize` cannot reach, above all a confidential one, which only its
+    /// owner's proofs can move. The account must have been frozen through Vigilantis at least
+    /// `SEIZE_DELAY_SECONDS` before and still be frozen. Vigilantis then keeps a `ForfeitureRecord`
+    /// for it, and `thaw_token_account` refuses the account for as long as the record exists; only
+    /// the admin can remove it, with `release_forfeiture` (for example after an appeal). Nothing is
+    /// burnt or moved: the tokens stay in the supply, and the issuer reports them apart from the
+    /// supply in circulation.
+    ///
+    /// `amount_commitment` is the issuer's own and optional (all zeros for none), for example
+    /// SHA-256 of a salt and the amount its auditor key shows, so that the amount can be proven later
+    /// without putting it on-chain. Vigilantis does not check it.
+    pub fn forfeit(
+        ctx: Context<Forfeit>,
+        reason_code: u16,
+        case_ref: [u8; 32],
+        amount_commitment: [u8; 32],
+    ) -> Result<()> {
+        authorize(
+            &ctx.accounts.policy_config,
+            &ctx.accounts.authority.key(),
+            &ctx.accounts.role,
+            permission::SEIZE,
+        )?;
+        require!(case_ref != [0u8; 32], VigilantisError::InvalidCaseRef);
+        let mint = ctx.accounts.mint.key();
+        let wallet = {
+            let data = ctx.accounts.token_account.try_borrow_data()?;
+            require!(
+                data.len() >= TOKEN_ACCOUNT_BASE_LEN && data[..32] == mint.to_bytes(),
+                VigilantisError::InvalidTokenAccount
+            );
+            require!(
+                data[TOKEN_ACCOUNT_STATE_OFFSET] == TOKEN_ACCOUNT_STATE_FROZEN,
+                VigilantisError::AccountNotFrozen
+            );
+            token_account_owner(&ctx.accounts.token_account)
+        };
+        let clock = Clock::get()?;
+        let earliest = ctx
+            .accounts
+            .freeze_record
+            .frozen_at
+            .saturating_add(SEIZE_DELAY_SECONDS);
+        require!(
+            clock.unix_timestamp >= earliest,
+            VigilantisError::SeizeTooEarly
+        );
+
+        let authority = ctx.accounts.authority.key();
+        let token_account = ctx.accounts.token_account.key();
+        ctx.accounts.forfeiture_record.set_inner(ForfeitureRecord {
+            mint,
+            wallet,
+            token_account,
+            reason_code,
+            case_ref,
+            amount_commitment,
+            authority,
+            forfeited_at: clock.unix_timestamp,
+            slot: clock.slot,
+            bump: ctx.bumps.forfeiture_record,
+        });
+        emit!(EnforcementAction {
+            mint,
+            wallet,
+            token_account,
+            action: EnforcementKind::Forfeit,
+            reason_code,
+            case_ref,
+            authority,
+        });
+        emit!(Forfeited {
+            mint,
+            wallet,
+            token_account,
+            reason_code,
+            case_ref,
+            amount_commitment,
+            authority,
+            forfeited_at: clock.unix_timestamp,
+        });
+        Ok(())
+    }
+
+    /// Remove a `ForfeitureRecord`, for example when a court lifts the forfeiture on appeal, so that
+    /// the account can be thawed again. The admin only, never a role holder: this is the one way
+    /// back from `forfeit`. The record's rent goes to the admin; the events of the forfeiture and of
+    /// its release stay in the chain's history. The account stays frozen until a
+    /// `thaw_token_account`.
+    pub fn release_forfeiture(ctx: Context<ReleaseForfeiture>, reason_code: u16) -> Result<()> {
+        let record = &ctx.accounts.forfeiture_record;
+        let authority = ctx.accounts.authority.key();
+        emit!(EnforcementAction {
+            mint: record.mint,
+            wallet: record.wallet,
+            token_account: record.token_account,
+            action: EnforcementKind::ReleaseForfeiture,
+            reason_code,
+            case_ref: record.case_ref,
+            authority,
+        });
+        emit!(ForfeitureReleased {
+            mint: record.mint,
+            wallet: record.wallet,
+            token_account: record.token_account,
+            case_ref: record.case_ref,
             reason_code,
             authority,
         });
@@ -1163,6 +1286,17 @@ fn write_freeze_record(ctx: &Context<SetFrozen>) -> Result<()> {
     };
     let mut data = info.try_borrow_mut_data()?;
     record.try_serialize(&mut &mut data[..])?;
+    Ok(())
+}
+
+/// Refuse a thaw while the token account has a `ForfeitureRecord`. Only `forfeit` can have written
+/// data owned by this program at that address, and only `release_forfeiture` removes it.
+fn require_not_forfeited(ctx: &Context<SetFrozen>) -> Result<()> {
+    let info = ctx.accounts.forfeiture_record.to_account_info();
+    require!(
+        info.owner != &crate::ID || info.data_is_empty(),
+        VigilantisError::AccountForfeited
+    );
     Ok(())
 }
 
@@ -1628,6 +1762,32 @@ pub enum SeizureOutcome {
     Other,
 }
 
+/// A token account frozen for good at the end of a case, because its balance (typically a
+/// confidential one) could not be seized. Written by `forfeit`, removed only by the admin's
+/// `release_forfeiture`; while it exists, `thaw_token_account` refuses the account.
+#[account]
+pub struct ForfeitureRecord {
+    pub mint: Pubkey,
+    /// The owner of the token account at the time of the forfeiture.
+    pub wallet: Pubkey,
+    pub token_account: Pubkey,
+    pub reason_code: u16,
+    pub case_ref: [u8; 32],
+    /// The issuer's commitment to the amount, for example SHA-256 of a salt and the amount, or all
+    /// zeros. Vigilantis does not check it.
+    pub amount_commitment: [u8; 32],
+    /// Who recorded the forfeiture.
+    pub authority: Pubkey,
+    /// Unix time of the forfeiture.
+    pub forfeited_at: i64,
+    pub slot: u64,
+    pub bump: u8,
+}
+
+impl ForfeitureRecord {
+    const LEN: usize = 8 + 32 + 32 + 32 + 2 + 32 + 32 + 32 + 8 + 8 + 1;
+}
+
 #[derive(Accounts)]
 pub struct InitializePolicy<'info> {
     #[account(mut)]
@@ -1951,6 +2111,14 @@ pub struct SetFrozen<'info> {
 
     pub system_program: Program<'info, System>,
 
+    /// CHECK: the token account's `ForfeitureRecord` PDA. It usually does not exist; while it does,
+    /// a thaw is refused (`require_not_forfeited`). A freeze does not read it.
+    #[account(
+        seeds = [FORFEITURE_SEED, mint.key().as_ref(), token_account.key().as_ref()],
+        bump
+    )]
+    pub forfeiture_record: UncheckedAccount<'info>,
+
     /// The signer's `RoleEntry` for this mint, when the signer is not the admin.
     pub role: Option<Account<'info, RoleEntry>>,
 }
@@ -2112,6 +2280,85 @@ pub struct CloseSeizure<'info> {
 
     /// The signer's `RoleEntry` for this mint, when the signer is not the admin.
     pub role: Option<Account<'info, RoleEntry>>,
+}
+
+#[derive(Accounts)]
+pub struct Forfeit<'info> {
+    /// The admin or a role holder; pays for the `ForfeitureRecord`.
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        constraint = mint.freeze_authority == COption::Some(freeze_authority.key())
+            @ VigilantisError::FreezeAuthorityNotVigilantis,
+    )]
+    pub mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        seeds = [POLICY_SEED, mint.key().as_ref()],
+        bump = policy_config.bump,
+    )]
+    pub policy_config: Account<'info, PolicyConfig>,
+
+    /// CHECK: a token account of `mint`, frozen; its mint and state are read in `forfeit`.
+    #[account(owner = token_program.key())]
+    pub token_account: UncheckedAccount<'info>,
+
+    /// When Vigilantis froze `token_account`; without one, the account cannot be forfeited.
+    #[account(
+        seeds = [FREEZE_RECORD_SEED, mint.key().as_ref(), token_account.key().as_ref()],
+        bump = freeze_record.bump,
+    )]
+    pub freeze_record: Account<'info, FreezeRecord>,
+
+    /// One per token account: a second `forfeit` of the same account fails.
+    #[account(
+        init,
+        payer = authority,
+        space = ForfeitureRecord::LEN,
+        seeds = [FORFEITURE_SEED, mint.key().as_ref(), token_account.key().as_ref()],
+        bump
+    )]
+    pub forfeiture_record: Account<'info, ForfeitureRecord>,
+
+    /// CHECK: Vigilantis's freeze-authority PDA for `mint`; holds no data, checked against the mint.
+    #[account(seeds = [FREEZE_AUTHORITY_SEED, mint.key().as_ref()], bump)]
+    pub freeze_authority: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token2022>,
+    pub system_program: Program<'info, System>,
+
+    /// The signer's `RoleEntry` for this mint, when the signer is not the admin.
+    pub role: Option<Account<'info, RoleEntry>>,
+}
+
+#[derive(Accounts)]
+pub struct ReleaseForfeiture<'info> {
+    /// The admin; gets the record's rent.
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// CHECK: the mint of the forfeiture (address only, used for the seeds).
+    pub mint: AccountInfo<'info>,
+
+    #[account(
+        seeds = [POLICY_SEED, mint.key().as_ref()],
+        bump = policy_config.bump,
+        has_one = authority @ VigilantisError::Unauthorized,
+    )]
+    pub policy_config: Account<'info, PolicyConfig>,
+
+    #[account(
+        mut,
+        close = authority,
+        seeds = [
+            FORFEITURE_SEED,
+            mint.key().as_ref(),
+            forfeiture_record.token_account.as_ref(),
+        ],
+        bump = forfeiture_record.bump,
+    )]
+    pub forfeiture_record: Account<'info, ForfeitureRecord>,
 }
 
 #[derive(Accounts)]
@@ -2281,7 +2528,7 @@ pub enum VigilantisError {
     NothingToSeize,
     #[msg("The token account was frozen through Vigilantis less than 24 hours ago")]
     SeizeTooEarly,
-    #[msg("A seizure needs a case reference")]
+    #[msg("A seizure or a forfeiture needs a case reference")]
     InvalidCaseRef,
     #[msg("Not a token account of this mint")]
     InvalidTokenAccount,
@@ -2291,6 +2538,8 @@ pub enum VigilantisError {
     OwnerCanChange,
     #[msg("Resume the mint before handing on or giving up its pause authority")]
     PausedMintHandover,
+    #[msg("The token account is forfeited; the admin must release the forfeiture before it can be thawed")]
+    AccountForfeited,
 }
 
 /// What an `EnforcementAction` did.
@@ -2305,6 +2554,9 @@ pub enum EnforcementKind {
     Resume,
     Seize,
     CloseSeizure,
+    // Appended in 1.0.0-rc.2.
+    Forfeit,
+    ReleaseForfeiture,
 }
 
 /// Which list an entry belongs to.
@@ -2376,17 +2628,18 @@ pub struct AuthorityTransferred {
 }
 
 /// Emitted by `block_wallet`, `unblock_wallet`, `freeze_token_account`, `thaw_token_account`,
-/// `pause`, `resume`, `seize` and `close_seizure`: what was done, to whom, and the issuer's reason. Vigilantis does not interpret `reason_code`;
+/// `pause`, `resume`, `seize`, `close_seizure`, `forfeit` and `release_forfeiture`: what was done,
+/// to whom, and the issuer's reason. Vigilantis does not interpret `reason_code`;
 /// `case_ref` points to the issuer's own case file (for example a salted hash of its case number),
 /// so no personal data needs to go on-chain.
 #[event]
 pub struct EnforcementAction {
     pub mint: Pubkey,
-    /// The blocked or unblocked wallet, or the owner of the frozen, thawed or seized token account;
-    /// the default address for a pause or resume.
+    /// The blocked or unblocked wallet, or the owner of the frozen, thawed, seized or forfeited
+    /// token account; the default address for a pause or resume.
     pub wallet: Pubkey,
-    /// The frozen, thawed or seized token account; the default address for a block, unblock, pause
-    /// or resume.
+    /// The frozen, thawed, seized or forfeited token account; the default address for a block,
+    /// unblock, pause or resume.
     pub token_account: Pubkey,
     pub action: EnforcementKind,
     pub reason_code: u16,
@@ -2450,6 +2703,30 @@ pub struct SeizureClosed {
     pub amount: u64,
     pub case_ref: [u8; 32],
     pub outcome: SeizureOutcome,
+    pub reason_code: u16,
+    pub authority: Pubkey,
+}
+
+/// Emitted by `forfeit`, next to `EnforcementAction`.
+#[event]
+pub struct Forfeited {
+    pub mint: Pubkey,
+    pub wallet: Pubkey,
+    pub token_account: Pubkey,
+    pub reason_code: u16,
+    pub case_ref: [u8; 32],
+    pub amount_commitment: [u8; 32],
+    pub authority: Pubkey,
+    pub forfeited_at: i64,
+}
+
+/// Emitted by `release_forfeiture`, next to `EnforcementAction`.
+#[event]
+pub struct ForfeitureReleased {
+    pub mint: Pubkey,
+    pub wallet: Pubkey,
+    pub token_account: Pubkey,
+    pub case_ref: [u8; 32],
     pub reason_code: u16,
     pub authority: Pubkey,
 }

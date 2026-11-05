@@ -3,7 +3,7 @@
 Vigilantis is security-sensitive, on-chain compliance software (a Token-2022 transfer hook that
 gates asset transfers).
 
-> **Maturity:** 1.0.0-rc.1, continuing Sentinel 2.3.0: self-audited, validated against a
+> **Maturity:** 1.0.0-rc.2, continuing Sentinel 2.3.0: self-audited, validated against a
 > local validator and by model-based fuzzing. **Not independently audited and not production-proven.**
 > Review carefully before any mainnet use.
 

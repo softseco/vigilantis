@@ -217,21 +217,28 @@ must create that account with Token-2022's `InitializeImmutableOwner` before `In
 
 | Role | Permissions | Key |
 |---|---|---|
-| Compliance officer | `block,unblock,freeze,thaw` | A hardware wallet per person |
-| Incident lead | `pause,resume` | A hardware wallet |
+| Compliance officer on duty | `block,freeze,pause` | A hardware wallet per person: these must work in seconds, for example while an exchange is being drained |
 | Onboarding system (after KYC) | `allowlist` | A hot key on the issuer's server; it can do nothing else |
-| Seizure | stays with the multisig | Seizure burns a balance; it waits 24 hours after the freeze anyway |
+| Thaw, unblock, resume | stay with the multisig | A stolen key could free a criminal's funds; a wrongly frozen holder waits hours, not days |
+| Seizure and forfeiture | stay with the multisig | Seizure burns a balance and forfeiture keeps it frozen for good; both wait 24 hours after the freeze anyway. Only the policy authority can release a forfeiture, whatever the roles |
+
+The program checks who signs, not whether a signer is a multisig: an action is the multisig's only
+because no single-key role holds its permission.
 
 ```bash
-vigilantis role grant <MINT> <OFFICER> --permissions block,unblock,freeze,thaw --multisig <ISSUER_VAULT>
+vigilantis role grant <MINT> <OFFICER> --permissions block,freeze,pause --multisig <ISSUER_VAULT>
 vigilantis role list <MINT>
 ```
 
 ## Emergency procedures
 
-Every enforcement command records a reason and, with `--case`, a case reference in the
-`EnforcementAction` event. The salt for `--case` comes from `VIGILANTIS_CASE_SALT` or
-`--case-salt-file`; each issuer keeps one salt, privately, for good.
+Every enforcement command records a reason (`--reason`) and a case reference (`--case`) in the
+`EnforcementAction` event. Both are optional, so a freeze, a block or a pause never waits for
+paperwork; `seize` and `forfeit` need both, `seizure close` and `forfeiture release` a reason.
+Give them whenever you can: they cannot be added to the event afterwards, so an action taken
+without them goes into the case register by its transaction signature. The salt for `--case`
+comes from `VIGILANTIS_CASE_SALT` or `--case-salt-file`; each issuer keeps one salt, privately,
+for good.
 
 **A wallet must be stopped now** (sanctions match, stolen funds, a court order). An officer runs:
 
@@ -242,7 +249,7 @@ vigilantis check <MINT> <WALLET>     # Blocklisted: yes; every token account fro
 
 The block and as many freezes as fit go in one transaction (six or seven, depending on who signs),
 so the wallet is never blocked with its first accounts still open. If a later transaction fails,
-the command lists the ones that went through; run `vigilantis freeze <MINT> <WALLET>` for the rest. A confidential balance can be frozen but not seized.
+the command lists the ones that went through; run `vigilantis freeze <MINT> <WALLET>` for the rest. A confidential balance can be frozen but not seized; when its case ends, forfeit it (below).
 
 **The whole token must stop** (the issuer's mint key is compromised, a bug in the hook, a
 regulator's request):
@@ -255,14 +262,36 @@ vigilantis status <MINT>             # Pause: PAUSED
 A pause stops every transfer, mint and burn of the token, confidential ones included. Freezing and
 thawing still work. `vigilantis resume` ends it.
 
+**A case ends and the balance cannot be seized** (it is confidential, and the holder does not
+withdraw it to the public balance). The account must have been frozen through Vigilantis at least
+24 hours before. Work out the amount with the auditor key, then:
+
+```bash
+vigilantis amount-commitment <AMOUNT>     # base units; salt from VIGILANTIS_AMOUNT_SALT, kept like the case salt
+vigilantis forfeit <MINT> <TOKEN_ACCOUNT> --reason court-order --case <CASE_ID> --amount-commitment <HEX> --multisig <ISSUER_VAULT>
+vigilantis forfeiture list <MINT>
+```
+
+From then on no thaw gets past the account, whoever signs. Nothing is burnt: report forfeited
+balances apart from the supply in circulation, and keep the amount and its salt in the case file,
+so the commitment can be shown to a court or an auditor. If the decision is overturned:
+
+```bash
+vigilantis forfeiture release <MINT> <TOKEN_ACCOUNT> --reason case-closed --multisig <ISSUER_VAULT>
+vigilantis thaw <MINT> <TOKEN_ACCOUNT> --reason case-closed --case <CASE_ID> --multisig <ISSUER_VAULT>
+```
+
+If the holder cooperates instead, keep the wallet blocked, thaw the account, let the holder withdraw
+the confidential balance to the public one, freeze it again and seize it 24 hours later.
+
 **A role holder's key is lost or compromised:**
 
 ```bash
 vigilantis role revoke <MINT> <HOLDER> --multisig <ISSUER_VAULT>
 ```
 
-Then go through the `EnforcementAction` events that key signed and undo what should not stand
-(`thaw`, `block remove`). A holder who still has the key can also give the role up with
+Then go through the `EnforcementAction` events that key signed and undo, through the multisig,
+what should not stand (`thaw`, `block remove`, `resume`). A holder who still has the key can also give the role up with
 `vigilantis role renounce <MINT>`.
 
 **A multisig member's device is lost or compromised:** replace the member in Squads (a
@@ -297,8 +326,8 @@ to pause their mints, and treat it as an incident.
 - [ ] After the deploy: the hash on chain equals the CI hash; the upgrade authority is the vault;
       the verification record published and the remote job shows the program as verified; the
       security.txt read back from chain.
-- [ ] This runbook rehearsed on devnet: block and freeze, pause and resume, revoke a role, an
-      upgrade.
+- [ ] This runbook rehearsed on devnet: block and freeze, pause and resume, a forfeiture and its
+      release, revoke a role, an upgrade.
 
 ## Deployment record
 
@@ -306,4 +335,4 @@ Keep one row per deployment and upgrade.
 
 | Date | Cluster | Program ID | Tag and commit | CI run | Executable hash | Deploy or upgrade tx | Authority handover tx | Verification record tx |
 |---|---|---|---|---|---|---|---|---|
-| | | | | | | | | |
+| 2026-11-04 | devnet | `4DoDFZJmJWYuBx86UqXi3y24GkQ3Cq4nUBHZwDE5PQM5` | `v1.0.0-rc.1`, `685b76355a1992e1465e60dd34c47b347b3e9bbb` | [41715396943](https://github.com/softseco/vigilantis/actions/runs/41715396943) | `5848016c8e88b4c53b14f3a9b2c35fd46d31e132106664c899db6c351fedd3c6` | `4jUgoiKLAtkbi45rkpGJJe8wuUygLd3KNoq4LgK9khCF7xNebcoZsksWEYanuTCAauKRTM6qFSaJiX9qwwiPN6Vt` | none yet: the deployer key `agAEFgxjKsnv2JaWCU8LD1GMx4vQcsXzH7mvRZuh5TQ` holds the upgrade authority on devnet | not yet |

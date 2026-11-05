@@ -36,6 +36,7 @@ import {
   MAX_TRANSACTION_BYTES,
   PERMISSIONS,
   VigilantisClient,
+  amountCommitment,
   caseRef,
   packInstructions,
   type Enforcement,
@@ -90,6 +91,8 @@ const OPTIONS = {
   case: { type: "string" },
   "case-ref": { type: "string" },
   "case-salt-file": { type: "string" },
+  "amount-commitment": { type: "string" },
+  "amount-salt-file": { type: "string" },
   permissions: { type: "string" },
   outcome: { type: "string" },
   allowlist: { type: "string" },
@@ -170,8 +173,14 @@ const REASON_NAMES = Object.keys(ENFORCEMENT_REASONS).map(kebab);
 const PERMISSION_NAMES = Object.keys(PERMISSIONS).filter((p) => p !== "all").map(kebab);
 const OUTCOMES: SeizureOutcome[] = ["returnedToOwner", "paidToVictim", "paidToState", "other"];
 
-function reasonArg(value: string | boolean | undefined): number {
+/**
+ * `--reason`. Optional (0, "unspecified") except where `required`: seizures and forfeitures always
+ * record why. Freezes, pauses and blocks may have to happen within seconds, before anyone has a
+ * case, so they never wait for one.
+ */
+function reasonArg(value: string | boolean | undefined, required = false): number {
   if (value === undefined) {
+    if (!required) return ENFORCEMENT_REASONS.unspecified;
     throw new UsageError(`this command records why it was done: add --reason (${REASON_NAMES.join(", ")} or a number)`);
   }
   const v = String(value);
@@ -267,11 +276,50 @@ function salt(ctx: { values: Values; io: CliIo }): string {
   );
 }
 
+/** `--reason` and `--case`. Both optional, except for seizures and forfeitures (`caseRequired`). */
 function enforcement(ctx: Context, caseRequired = false): Enforcement {
-  const reasonCode = reasonArg(ctx.values.reason);
+  const reasonCode = reasonArg(ctx.values.reason, caseRequired);
   const ref = caseRefArg(ctx);
   if (!ref && caseRequired) throw new UsageError("this command needs a case: add --case <id> or --case-ref <hex>");
   return { reasonCode, caseRef: ref ?? new Uint8Array(32) };
+}
+
+/** An amount in base units for `amount-commitment`. */
+function baseUnits(value: string): bigint {
+  if (!/^\d+$/.test(value) || BigInt(value) > 0xffffffffffffffffn) {
+    throw new UsageError(`the amount is a whole number of base units, got ${value}`);
+  }
+  return BigInt(value);
+}
+
+/**
+ * The salt for `amount-commitment`, from VIGILANTIS_AMOUNT_SALT or `--amount-salt-file`, never from
+ * the command line. Keep it apart from the case salt.
+ */
+function amountSalt(ctx: { values: Values; io: CliIo }): string {
+  const file = ctx.values["amount-salt-file"];
+  if (file !== undefined) {
+    let text: string;
+    try {
+      text = readFileSync(String(file), "utf8");
+    } catch (e) {
+      throw new UsageError(`cannot read the amount salt file ${file}: ${(e as Error).message}`);
+    }
+    const value = text.replace(/^\uFEFF/, "").trim();
+    if (!value) throw new UsageError(`the amount salt file ${file} is empty`);
+    return checkedSalt(value, ctx);
+  }
+  const env = ctx.io.env.VIGILANTIS_AMOUNT_SALT?.trim();
+  if (env) return checkedSalt(env, ctx);
+  throw new UsageError("amount-commitment needs a salt: set VIGILANTIS_AMOUNT_SALT or pass --amount-salt-file <path>");
+}
+
+/** `--amount-commitment`: 64 hex characters, or nothing (all zeros on-chain). */
+function amountCommitmentArg(value: string | boolean | undefined): Uint8Array | undefined {
+  if (value === undefined) return undefined;
+  const hex = String(value).replace(/^0x/, "");
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) throw new UsageError("--amount-commitment takes 64 hex characters (32 bytes)");
+  return Uint8Array.from(Buffer.from(hex, "hex"));
 }
 
 function hasEnforcement(values: Values): boolean {
@@ -403,9 +451,24 @@ async function freezeOrThaw(ctx: Context, args: string[], thaw: boolean) {
   if (accounts.length === 0) {
     throw new Error(`${target.toBase58()} holds no token account of ${mint.toBase58()}`);
   }
-  const todo = accounts.filter((a) => a.frozen === thaw);
+  let todo = accounts.filter((a) => a.frozen === thaw);
   const verb = thaw ? "thaw" : "freeze";
   const what = wallet ? `token accounts of ${wallet.toBase58()}` : target.toBase58();
+  if (thaw && todo.length > 0) {
+    // A forfeited account cannot be thawed until the admin releases the forfeiture.
+    const forfeited = await ctx.client.forfeitedAmong(mint, todo.map((a) => a.address));
+    if (forfeited.size > 0) {
+      if (!wallet) {
+        throw new Error(
+          `${target.toBase58()} is forfeited; the admin must run \`vigilantis forfeiture release\` before it can be thawed`,
+        );
+      }
+      if (!ctx.values.json) {
+        ctx.io.err(`skipping ${forfeited.size} forfeited token account${forfeited.size === 1 ? "" : "s"}; see \`vigilantis forfeiture list\``);
+      }
+      todo = todo.filter((a) => !forfeited.has(a.address.toBase58()));
+    }
+  }
   if (todo.length === 0) {
     if (ctx.values.json) return json(ctx, { action: `${verb} ${what}`, signatures: [], alreadyDone: true });
     ctx.io.out(`Nothing to ${verb}: ${wallet ? "every token account of the wallet is" : "the account is"} already ${thaw ? "thawed" : "frozen"}.`);
@@ -424,10 +487,10 @@ async function listCommand(ctx: Context, args: string[], list: "allow" | "block"
   const mint = address(args[0], "mint");
   if (args.length < 2) throw new UsageError("give at least one wallet");
   const wallets = args.slice(1).map((w) => address(w, "wallet"));
-  const recorded = list === "block" && hasEnforcement(ctx.values);
   const freeze = list === "block" && action === "add" && ctx.values.freeze === true;
+  // With --freeze, the block is recorded too (reason "unspecified" when none is given).
+  const recorded = list === "block" && (hasEnforcement(ctx.values) || freeze);
   if (freeze && wallets.length !== 1) throw new UsageError("--freeze takes one wallet at a time");
-  if (freeze && !recorded) throw new UsageError("--freeze records why: add --reason");
   // Lists hold wallets. A token account's address on a list would match nothing: the hook looks
   // up the owner of each token account.
   if (list === "block" || list === "allow") {
@@ -513,18 +576,19 @@ const COMMANDS: Command[] = [
   {
     name: "status",
     usage: "<mint>",
-    summary: "the policy, the mint's authorities, pause state, roles and open seizures",
+    summary: "the policy, the mint's authorities, pause state, roles, open seizures and forfeitures",
     group: "Reading",
     async run(ctx, [m]) {
       const mint = address(m, "mint");
       const { client, connection } = ctx;
       const policy = await policyOrFail(ctx, mint);
       const mintInfo = await getMint(connection, mint, "confirmed", TOKEN_2022_PROGRAM_ID);
-      const [pending, pause, roles, seizures, metaList] = await Promise.all([
+      const [pending, pause, roles, seizures, forfeitures, metaList] = await Promise.all([
         client.getPendingAuthority(mint),
         client.getPauseState(mint),
         client.listRoles(mint),
         client.listSeizures(mint),
+        client.listForfeitures(mint),
         connection.getAccountInfo(client.metaList(mint), "confirmed"),
       ]);
       const hookExtension = getTransferHook(mintInfo);
@@ -544,6 +608,7 @@ const COMMANDS: Command[] = [
         permanentDelegate: delegate && !delegate.equals(PublicKey.default) ? delegate : null,
         roles: roles.map((r) => ({ ...r, permissionNames: permissionNames(r.permissions) })),
         seizures,
+        forfeitures,
       };
       if (ctx.values.json) return json(ctx, status);
       const limit = policy.maxTransferAmount;
@@ -579,6 +644,11 @@ const COMMANDS: Command[] = [
           `  ${s.tokenAccount.toBase58()}`,
           `${s.amount} base units of ${s.wallet.toBase58()}, seized ${time(s.seizedAt)}, case ${Buffer.from(s.caseRef).toString("hex")}`,
         ]),
+        ["Forfeited accounts", String(forfeitures.length)],
+        ...forfeitures.map((f): [string, string] => [
+          `  ${f.tokenAccount.toBase58()}`,
+          `of ${f.wallet.toBase58()}, forfeited ${time(f.forfeitedAt)}, case ${Buffer.from(f.caseRef).toString("hex")}`,
+        ]),
       ]);
     },
   },
@@ -598,14 +668,17 @@ const COMMANDS: Command[] = [
         client.getRole(mint, wallet),
         client.tokenAccountsOf(mint, wallet),
       ]);
-      const records = await Promise.all(accounts.map((a) => client.getFreezeRecord(mint, a.address)));
+      const [records, forfeitures] = await Promise.all([
+        Promise.all(accounts.map((a) => client.getFreezeRecord(mint, a.address))),
+        Promise.all(accounts.map((a) => client.getForfeiture(mint, a.address))),
+      ]);
       const view = {
         wallet,
         allowlisted,
         blocklisted,
         isPolicyAuthority: policy.authority.equals(wallet),
         role: role ? { ...role, permissionNames: permissionNames(role.permissions) } : null,
-        tokenAccounts: accounts.map((a, i) => ({ ...a, freezeRecord: records[i] })),
+        tokenAccounts: accounts.map((a, i) => ({ ...a, freezeRecord: records[i], forfeiture: forfeitures[i] })),
       };
       if (ctx.values.json) return json(ctx, view);
       table(ctx, [
@@ -616,8 +689,15 @@ const COMMANDS: Command[] = [
         ["Token accounts", String(accounts.length)],
         ...accounts.map((a, i): [string, string] => {
           const r = records[i];
-          const freeze = !a.frozen ? "not frozen" : r ? `frozen ${time(r.frozenAt)}, seizable from ${time(r.seizableFrom)}` : "frozen";
-          return [`  ${a.address.toBase58()}`, `${a.amount} base units, ${freeze}`];
+          const f = forfeitures[i];
+          const freeze = f
+            ? `FORFEITED ${time(f.forfeitedAt)} (case ${Buffer.from(f.caseRef).toString("hex")}); frozen until the admin releases it`
+            : !a.frozen
+              ? "not frozen"
+              : r
+                ? `frozen ${time(r.frozenAt)}, seizable or forfeitable from ${time(r.seizableFrom)}`
+                : "frozen";
+          return [`  ${a.address.toBase58()}`, `${a.amount} public base units, ${freeze}`];
         }),
       ]);
     },
@@ -634,6 +714,20 @@ const COMMANDS: Command[] = [
       const ref = Buffer.from(caseRef(caseId(id, "the case ID"), salt(ctx))).toString("hex");
       if (ctx.values.json) return json(ctx, { caseRef: ref });
       ctx.io.out(ref);
+    },
+  },
+  {
+    name: "amount-commitment",
+    usage: "<amount>",
+    summary: "print the 32-byte commitment to an amount in base units, hashed with the amount salt",
+    group: "Reading",
+    options: ["amount-salt-file"],
+    offline: true,
+    async run(ctx, [a]) {
+      if (a === undefined) throw new UsageError("missing amount (in base units)");
+      const commitment = Buffer.from(amountCommitment(baseUnits(a), amountSalt(ctx))).toString("hex");
+      if (ctx.values.json) return json(ctx, { amountCommitment: commitment });
+      ctx.io.out(commitment);
     },
   },
 
@@ -748,7 +842,7 @@ const COMMANDS: Command[] = [
   },
   {
     name: "block add",
-    usage: "<mint> <wallet>... [--reason <r> [--case <id>]] [--freeze]",
+    usage: "<mint> <wallet>... [--reason <r>] [--case <id>] [--freeze]",
     summary: "blocklist wallets; with --reason, record why; with --freeze, also freeze the wallet's accounts",
     group: "Lists (the policy authority or a role)",
     options: [...ENFORCEMENT, "freeze"],
@@ -757,7 +851,7 @@ const COMMANDS: Command[] = [
   },
   {
     name: "block remove",
-    usage: "<mint> <wallet>... [--reason <r> [--case <id>]]",
+    usage: "<mint> <wallet>... [--reason <r>] [--case <id>]",
     summary: "take wallets off the blocklist; with --reason, record why",
     group: "Lists (the policy authority or a role)",
     options: ENFORCEMENT,
@@ -768,7 +862,7 @@ const COMMANDS: Command[] = [
   // Enforcement
   {
     name: "freeze",
-    usage: "<mint> <wallet|token-account> --reason <r> [--case <id>]",
+    usage: "<mint> <wallet|token-account> [--reason <r>] [--case <id>]",
     summary: "freeze a token account, or every token account of a wallet",
     group: "Enforcement (the policy authority or a role)",
     options: ENFORCEMENT,
@@ -777,7 +871,7 @@ const COMMANDS: Command[] = [
   },
   {
     name: "thaw",
-    usage: "<mint> <wallet|token-account> --reason <r> [--case <id>]",
+    usage: "<mint> <wallet|token-account> [--reason <r>] [--case <id>]",
     summary: "thaw a token account, or every frozen token account of a wallet",
     group: "Enforcement (the policy authority or a role)",
     options: ENFORCEMENT,
@@ -786,7 +880,7 @@ const COMMANDS: Command[] = [
   },
   {
     name: "pause",
-    usage: "<mint> --reason <r> [--case <id>]",
+    usage: "<mint> [--reason <r>] [--case <id>]",
     summary: "stop every transfer, mint and burn of the token",
     group: "Enforcement (the policy authority or a role)",
     options: ENFORCEMENT,
@@ -799,7 +893,7 @@ const COMMANDS: Command[] = [
   },
   {
     name: "resume",
-    usage: "<mint> --reason <r> [--case <id>]",
+    usage: "<mint> [--reason <r>] [--case <id>]",
     summary: "end a pause",
     group: "Enforcement (the policy authority or a role)",
     options: ENFORCEMENT,
@@ -855,6 +949,60 @@ const COMMANDS: Command[] = [
       for (const s of seizures) {
         ctx.io.out(`${s.tokenAccount.toBase58()}  ${s.amount} base units of ${s.wallet.toBase58()}`);
         ctx.io.out(`  seized ${time(s.seizedAt)} by ${s.authority.toBase58()}, reason ${s.reasonCode}, case ${Buffer.from(s.caseRef).toString("hex")}`);
+      }
+    },
+  },
+  {
+    name: "forfeit",
+    usage: "<mint> <token-account> --reason <r> --case <id> [--amount-commitment <hex>]",
+    summary: "end a case whose balance cannot be seized: the account, frozen 24 hours or more, stays frozen until released",
+    group: "Enforcement (the policy authority or a role)",
+    options: [...ENFORCEMENT, "amount-commitment"],
+    multisig: true,
+    async run(ctx, [m, t]) {
+      const mint = address(m, "mint");
+      const tokenAccount = address(t, "token account");
+      const commitment = amountCommitmentArg(ctx.values["amount-commitment"]);
+      const ix = await ctx.client.forfeitInstruction({
+        mint,
+        tokenAccount,
+        enforcement: enforcement(ctx, true),
+        amountCommitment: commitment,
+        authority: ctx.authority,
+      });
+      await submit(ctx, `forfeit ${tokenAccount.toBase58()} (it stays frozen until the admin releases it)`, [[ix]]);
+    },
+  },
+  {
+    name: "forfeiture release",
+    usage: "<mint> <token-account> --reason <r>",
+    summary: "remove a forfeiture, for example after an appeal, so the account can be thawed (the admin only)",
+    group: "Enforcement (the policy authority or a role)",
+    options: ["reason"],
+    multisig: true,
+    async run(ctx, [m, t]) {
+      const mint = address(m, "mint");
+      const tokenAccount = address(t, "token account");
+      const reasonCode = reasonArg(ctx.values.reason, true);
+      if (!(await ctx.client.getForfeiture(mint, tokenAccount))) {
+        throw new Error(`${tokenAccount.toBase58()} is not forfeited`);
+      }
+      const ix = await ctx.client.releaseForfeitureInstruction({ mint, tokenAccount, reasonCode, authority: ctx.authority });
+      await submit(ctx, `release the forfeiture of ${tokenAccount.toBase58()} (it stays frozen until a thaw)`, [[ix]]);
+    },
+  },
+  {
+    name: "forfeiture list",
+    usage: "<mint>",
+    summary: "every forfeited token account",
+    group: "Enforcement (the policy authority or a role)",
+    async run(ctx, [m]) {
+      const forfeitures = await ctx.client.listForfeitures(address(m, "mint"));
+      if (ctx.values.json) return json(ctx, forfeitures);
+      if (forfeitures.length === 0) return ctx.io.out("No forfeited accounts.");
+      for (const f of forfeitures) {
+        ctx.io.out(`${f.tokenAccount.toBase58()}  of ${f.wallet.toBase58()}`);
+        ctx.io.out(`  forfeited ${time(f.forfeitedAt)} by ${f.authority.toBase58()}, reason ${f.reasonCode}, case ${Buffer.from(f.caseRef).toString("hex")}`);
       }
     },
   },
@@ -978,7 +1126,7 @@ const COMMANDS: Command[] = [
   },
   {
     name: "freeze-authority set",
-    usage: "<mint> <address|none> --reason <r> [--case <id>] [--give-up]",
+    usage: "<mint> <address|none> [--reason <r>] [--case <id>] [--give-up]",
     summary: "hand the mint's freeze authority from Vigilantis to an address, or give it up",
     group: "Authorities (the policy authority)",
     options: [...ENFORCEMENT, "give-up"],
@@ -995,7 +1143,7 @@ const COMMANDS: Command[] = [
   },
   {
     name: "pause-authority set",
-    usage: "<mint> <address|none> --reason <r> [--case <id>] [--give-up]",
+    usage: "<mint> <address|none> [--reason <r>] [--case <id>] [--give-up]",
     summary: "hand the mint's pause authority from Vigilantis to an address, or give it up",
     group: "Authorities (the policy authority)",
     options: [...ENFORCEMENT, "give-up"],
@@ -1038,11 +1186,14 @@ function help(): string {
     "      --json              Machine-readable output.",
     "  -h, --help, -V, --version",
     "",
-    "Why and which case (recorded on chain in the EnforcementAction event)",
+    "Why and which case (recorded on chain in the EnforcementAction event). Optional, so a freeze or a pause",
+    "never waits; seize and forfeit need both, seizure close and forfeiture release need a reason.",
     `      --reason <reason>   ${REASON_NAMES.join(", ")}, or a number 0-65535.`,
     "      --case <id>         The case ID, hashed with a salt from VIGILANTIS_CASE_SALT or --case-salt-file <path>,",
     "                          so the chain holds no case number. Keep the salt private and always the same.",
     "      --case-ref <hex>    The 32-byte case reference itself, as `case-ref` or `seizure list` prints it.",
+    "      --amount-commitment <hex>  For forfeit: the 32 bytes `amount-commitment` prints, with its salt from",
+    "                          VIGILANTIS_AMOUNT_SALT or --amount-salt-file <path>. Keep that salt private too.",
     "",
     "Amounts are in base units. Exit codes: 0 done; 1 failed (the RPC, a refused transaction, or nothing on",
     "chain to act on); 2 a mistake in the command line.",

@@ -22,7 +22,11 @@ transfers, mints or burns until it resumes. Under a court order, it can seize a 
 public balance: Vigilantis burns it, no earlier than 24 hours after the freeze, and keeps a record
 open until the case is closed. Nothing is moved to anyone; paying out under the judgment is the
 issuer's own step. Both need the mint to be created with Token-2022's Pausable extension and a
-permanent delegate, each held by Vigilantis. And the issuer's admin key does not have to do all of
+permanent delegate, each held by Vigilantis. When a case ends and the balance could not be seized
+(a confidential balance, which no one can burn without its owner's key, is the main case), the
+issuer records a forfeiture instead: the account stays frozen, no thaw gets past the record, and
+only the admin can release it. The record can commit to the amount, which the issuer learns from
+the auditor key, without making it public. And the issuer's admin key does not have to do all of
 this itself: it can give a compliance officer a role with just the permissions the job needs, for
 example freeze but not thaw.
 
@@ -33,7 +37,7 @@ mint that sets `maxTransferAmount` refuses confidential transfers unless its pol
 The allowlist and blocklist work on addresses, which stay public, so they apply to confidential
 transfers exactly as they do to public ones.
 
-> **Status: 1.0.0-rc.1**, the release candidate for an independent audit. Vigilantis continues
+> **Status: 1.0.0-rc.2**, the release candidate for an independent audit. Vigilantis continues
 > Sentinel 2.3.0 (`@softseco/sentinel`) under a new name. Self-audited, not independently audited.
 > Built by Softseco.
 >
@@ -51,22 +55,23 @@ own transfer-gating program. Set a policy once; Vigilantis enforces it on every 
 
 - **On-chain program** (Rust / Anchor) — the transfer hook + policy, allowlist, blocklist, limit;
   freezing and thawing token accounts, with the reason recorded; pausing the token; seizing a
-  frozen account's balance under a court order; roles with chosen permissions; a two-step handover
+  frozen account's balance under a court order, or recording a forfeiture where it cannot be
+  seized; roles with chosen permissions; a two-step handover
   of the policy authority (to a multisig, for example); an event for every policy change, every
-  enforcement action and every refused transfer. 91 integration tests on a local validator, 13 of them with
+  enforcement action and every refused transfer. 96 integration tests on a local validator, 13 of them with
   real Token-2022 confidential transfers, where Token-2022 itself calls the hook. CI runs all of
   them on every push, and once a week against the Token-2022 deployed on mainnet.
 - **Model-based fuzzing** — [`tests-fuzz/`](./tests-fuzz): random sequences of every instruction,
-  transfer, approval, freeze, thaw, pause, seizure and role change in LiteSVM, with the clock moved
+  transfer, approval, freeze, thaw, pause, seizure, forfeiture and role change in LiteSVM, with the clock moved
   forward, each outcome, the whole state and every enforcement event checked against a model of
-  the rules after every step. CI runs a new random set on every push. Next to it, 11 LiteSVM tests
-  of roles, pause and seizure, which needs the clock 24 hours ahead.
+  the rules after every step. CI runs a new random set on every push. Next to it, 13 LiteSVM tests
+  of roles, pause, seizure and forfeiture, which need the clock 24 hours ahead.
 - **Threat model** — [`docs/threat-model.md`](./docs/threat-model.md): what Vigilantis protects, who
   is trusted, the invariants it keeps, and its known limits.
 - **Audit scope** — [`docs/audit-scope.md`](./docs/audit-scope.md): what an auditor reads, how to
   build and test it, and what the hook costs a transfer in compute units and bytes.
 - **TypeScript SDK** — [`@softseco/vigilantis`](https://www.npmjs.com/package/@softseco/vigilantis):
-  create a compliant mint, manage the policy and entries, freeze and thaw, pause, seize, roles,
+  create a compliant mint, manage the policy and entries, freeze and thaw, pause, seize, forfeit, roles,
   hook-aware transfers, and reads. It installs a `vigilantis` command line for the same operations,
   which can also print each transaction for a multisig to propose.
 - **Deployment plan and runbook** — [`docs/deployment.md`](./docs/deployment.md): who holds which
@@ -107,7 +112,7 @@ To pause and seize as well, create the mint with both extensions held by Vigilan
 compliance officer a role:
 
 ```ts
-import { PERMISSIONS } from "@softseco/vigilantis";
+import { PERMISSIONS, amountCommitment } from "@softseco/vigilantis";
 
 await vigilantis.createCompliantMint({ mint, decimals: 0, freezeAuthority: "vigilantis", pausable: true, permanentDelegate: true });
 // ... policy and meta list as above ...
@@ -116,6 +121,8 @@ await vigilantis.pause(mint.publicKey, why);   // the whole token, until resume(
 await vigilantis.resume(mint.publicKey, why);
 // 24 hours or more after the freeze, under a court order:
 await vigilantis.seize(mint.publicKey, suspectTokenAccount, why);
+// Or, when the balance cannot be burned (it is confidential), close the case with a forfeiture:
+await vigilantis.forfeit(mint.publicKey, suspectTokenAccount, why, amountCommitment(amount, amountSalt));
 ```
 
 ## Try it in your browser
@@ -155,8 +162,8 @@ docs/                threat model, audit scope, deployment plan and runbook
 
 ## Status
 
-**1.0.0-rc.1**, continuing Sentinel 2.3.0: program + SDK + demo, 91 integration tests,
-11 LiteSVM enforcement tests and model-based fuzzing, self-audited (see [CHANGELOG.md](./CHANGELOG.md) · [SECURITY.md](./SECURITY.md) ·
+**1.0.0-rc.2**, continuing Sentinel 2.3.0: program + SDK + demo, 96 integration tests,
+13 LiteSVM enforcement tests and model-based fuzzing, self-audited (see [CHANGELOG.md](./CHANGELOG.md) · [SECURITY.md](./SECURITY.md) ·
 [threat model](./docs/threat-model.md)). Not independently audited. Preparing for an independent
 audit: see the [audit scope](./docs/audit-scope.md). Vigilantis's program ID is
 `4DoDFZJmJWYuBx86UqXi3y24GkQ3Cq4nUBHZwDE5PQM5`, on devnet from its first deployment there; Sentinel 2.1.0
@@ -168,8 +175,8 @@ since 12 October 2026.
 ```bash
 anchor build -- --tools-version v1.57                                   # program
 anchor idl build -o sdk/src/idl/vigilantis.json -t sdk/src/idl/vigilantis.ts  # IDL
-anchor test --skip-build                                                # 91 integration tests
-cd tests-fuzz && cargo test --test enforcement                          # roles, pause, seizure (needs the build)
+anchor test --skip-build                                                # 96 integration tests
+cd tests-fuzz && cargo test --test enforcement                          # roles, pause, seizure, forfeiture (needs the build)
 cd tests-fuzz && cargo test --test model -- --nocapture                 # fuzzing (needs the build)
 cd sdk && npm install && npm run build                                  # SDK
 ```

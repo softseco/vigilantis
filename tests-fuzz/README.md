@@ -5,8 +5,8 @@ The integration tests in `tests/` check one situation at a time. These tests thr
 sequences of operations at the program instead, and check every step against a model of the
 rules written in plain Rust.
 
-Next to them, `tests/enforcement.rs` checks roles, pause and seizure one situation at a time (11
-tests). It lives here rather than in `tests/` because a seizure needs the clock 24 hours ahead,
+Next to them, `tests/enforcement.rs` checks roles, pause, seizure and forfeiture one situation at a
+time (13 tests). It lives here rather than in `tests/` because a seizure or a forfeiture needs the clock 24 hours ahead,
 which LiteSVM can do and a local validator cannot:
 
 ```bash
@@ -35,7 +35,10 @@ cargo test --test model -- --nocapture
 | `VIGILANTIS_SO`, `TOKEN_2022_SO` | the paths above | Programs to load |
 
 The first build compiles the Solana runtime and takes several minutes. A default run then takes
-about 8 seconds and makes about 4,000 operations.
+about 8 seconds and makes about 4,000 operations. On 5 November 2026 a run of 1,500 cases
+(`FUZZ_SEED=20261105`) made 94,481 operations, among them 217 forfeitures, 66 releases, 117
+refused thaws of forfeited accounts and 107 transfers of the whole supply refused as confidential,
+all as the model expected.
 
 A failure prints the seed, the case, the step, what the model expected, what happened (with the
 program logs) and the operations that led there. `FUZZ_SEED=<seed>` reproduces it exactly.
@@ -43,7 +46,9 @@ program logs) and the operations that led there. `FUZZ_SEED=<seed>` reproduces i
 ## What a case does
 
 Setup: a mint with Vigilantis as its transfer hook, five wallets with token accounts and random
-balances. The mint's freeze authority is Vigilantis's freeze address in most cases, the issuer in
+balances; in a few cases (1.0.0-rc.2) wallet 0 holds the whole supply, `u64::MAX` base units, and
+sends all of it now and then, which reaches the hook with the amount Token-2022 passes for a
+confidential transfer. The mint's freeze authority is Vigilantis's freeze address in most cases, the issuer in
 some, and nobody in a few. Its permanent delegate is Vigilantis's address, the issuer or nobody,
 and it is Pausable (with Vigilantis's pause address or the issuer as pause authority) or not. Most cases then create the policy (random rules) and the meta list;
 some start without one or both, and some have a stranger fund the policy or meta-list address
@@ -74,6 +79,10 @@ Then random operations, each picked from:
 - (1.0) pauses and resumes, and the pause authority handed on by Vigilantis or handed to it;
 - (1.0) seizures, mostly of frozen accounts, with a case reference that is new, already used or
   all zeros, and their closing with a random outcome;
+- (1.0.0-rc.2) forfeitures, mostly of frozen accounts and sometimes at the exact second the 24
+  hours end, with a case reference or all zeros; thaws of forfeited accounts, by the admin and by
+  role holders; and releases, by the admin and by others, of forfeited accounts and of ones that
+  are not;
 - (1.0) the clock moved forward by one hour, 12 hours, one second short of 24 hours, exactly 24
   hours or about 28 hours.
 
@@ -84,14 +93,16 @@ Then random operations, each picked from:
   `RecipientBlocked`, `Unauthorized`, `ConfidentialAmountNotEnforceable`, `AuthorityBlocked`,
   `InvalidAuthority`, `FreezeAuthorityNotVigilantis`, and in 1.0 `InvalidPermissions`,
   `PauseAuthorityNotVigilantis`, `PermanentDelegateNotVigilantis`, `AccountNotFrozen`,
-  `NothingToSeize`, `SeizeTooEarly`, `InvalidCaseRef`, `InvalidTokenAccount`), in the order the
+  `NothingToSeize`, `SeizeTooEarly`, `InvalidCaseRef`, `InvalidTokenAccount`, and in 1.0.0-rc.2
+  `AccountForfeited`), in the order the
   program checks them; Anchor's own codes where an account fails to load or a constraint fails
   first; and Token-2022's `AccountFrozen`, `InvalidState` and `MintPaused` where those come first.
 - **The whole state.** The policy (mint, authority, rules), every allow and block entry, a pending
   handover, every balance, delegation and frozen flag, the mint's freeze authority, the meta list's
   bytes (which only `initialize` and `update_extra_account_meta_list` may change), the total
   supply, and in 1.0 every role entry, the pause state and pause authority, every freeze record
-  and every open seizure.
+  and every open seizure; in 1.0.0-rc.2 every forfeiture record, and that every forfeited account
+  is frozen.
 - **The record.** Every `EnforcementAction` and `FreezeAuthorityChanged` event a successful step
   emitted, decoded from its logs and compared field by field with what the model expects; a step
   that should emit none must emit none.
@@ -101,8 +112,8 @@ only the policy authority changes the rules, only the mint authority sets up and
 that, a handover needs both sides, blocklist, allowlist, limit and confidential amounts, entries
 cannot be forged, the hook holds no state, only the policy authority (or a role allowed to) freezes
 and only through the mint's own freeze address, enforcement is recorded, a role does exactly what
-it says, pause goes only through the mint's own pause address, and a seizure is slow, complete and
-recorded.
+it says, pause goes only through the mint's own pause address, a seizure is slow, complete and
+recorded, and a forfeited account stays frozen until the admin releases it.
 
 It also models the Token-2022 behaviour that decides outcomes here: a frozen source is refused
 first; a transfer whose source and destination are the same account then returns before the hook
@@ -123,19 +134,18 @@ a rule switched off, an off-by-one), builds each broken program and runs these t
 python3 tests-fuzz/mutants.py          # from the repository root; about 10 s per mutant
 ```
 
-With 256 cases (`FUZZ_CASES=256`, 29 October 2026), all 70 are caught:
+With 256 cases (`FUZZ_CASES=256`, 5 November 2026), all 79 are caught:
 
 | Mutant | What it breaks | Result |
 |---|---|---|
 | `limit-off-by-one` | the limit refuses a transfer equal to it | caught |
 | `limit-ignored` | the limit is never checked | caught |
-| `confidential-limit-ignored` | confidential transfers pass a limited mint without `allow_confidential` | caught |
+| `confidential-limit-ignored` | confidential transfers pass a limited mint without `allow_confidential` | caught (since 1.0.0-rc.2 through a public transfer of the whole supply) |
 | `sender-blocklist-off` | a blocklisted sender is not refused | caught |
 | `recipient-blocklist-off` | a blocklisted recipient is not refused | caught |
 | `authority-blocklist-off` | a blocklisted delegate is not refused | caught |
 | `blocklist-flag-ignored` | the blocklist applies while switched off | caught |
 | `allowlist-off` | the allowlist is never checked | caught |
-| `any-block-entry-blocks` | any block entry passed as the authority's blocks the transfer | caught |
 | `rules-in-wrong-order` | sender and recipient checks swapped (wrong error code) | caught |
 | `update-policy-anyone` | anyone can change the rules | caught |
 | `add-allow-anyone` | anyone can allowlist | caught |
@@ -197,6 +207,16 @@ With 256 cases (`FUZZ_CASES=256`, 29 October 2026), all 70 are caught:
 | `freeze-record-not-written` | a freeze writes no freeze record | caught |
 | `thaw-keeps-freeze-record` | a thaw keeps the freeze record, so a new freeze can be seized at once | caught |
 | `close-seizure-anyone` | anyone can close a seizure | caught |
+| `forfeit-anyone` | anyone can forfeit an account | caught |
+| `forfeit-with-thaw-permission` | THAW is enough to forfeit | caught |
+| `forfeit-delay-off` | no 24-hour wait before a forfeiture | caught |
+| `forfeit-delay-off-by-one` | a forfeiture at exactly 24 hours is refused | caught |
+| `forfeit-without-case-ref` | a forfeiture with an all-zero case reference is accepted | caught |
+| `forfeit-freeze-authority-check-off` | a forfeiture on a mint whose freeze authority is not Vigilantis's address is accepted | caught |
+| `forfeit-recorded-as-seize` | a forfeiture is recorded as a seizure | caught |
+| `thaw-ignores-forfeiture` | a forfeited account can be thawed | caught |
+| `release-forfeiture-anyone` | anyone can release a forfeiture | caught |
+| `release-recorded-without-case` | a release is recorded without the case of its forfeiture | caught |
 
 A mutant that survives points to a gap in the model or in what the generator tries.
 `accept-wrong-rent-receiver` survived the first run, because the generator rarely named a wrong
@@ -214,6 +234,16 @@ role for wallet 0 holding every permission, and gated actions sometimes pass tha
 some runs and not in others. The generator now has role holders try list changes more often, has
 someone other than the admin try half the revocations, and moves the clock to the exact second a
 frozen account becomes seizable, then tries to seize it.
+
+The first full run after 1.0.0-rc.1 (5 November) missed two of the 80 mutants then in the script.
+Both had been caught through a direct `Execute`, which the hook has refused since 1.0.0-rc.1 (and
+`mutants.py` had stopped before running any, on two mutants that no longer matched the source).
+`confidential-limit-ignored` is now caught through a real transfer: a few cases give one wallet the
+whole supply, and a public transfer of all of it reaches the hook with the amount Token-2022 passes
+for a confidential one. `any-block-entry-blocks` (any block entry passed as the authority's blocks
+the transfer) is dropped: Token-2022 passes that entry at its derived address, so the hook's check
+of its mint and wallet cannot fail any more, and the mutant behaves exactly like the program. The
+check stays, as defence in depth.
 
 ## Coverage
 

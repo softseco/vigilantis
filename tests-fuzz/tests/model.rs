@@ -34,6 +34,11 @@
 //! cover the role entries, the pause state, every freeze record and open seizure, and the mint's
 //! supply, which a seizure lowers by exactly what it burnt.
 //!
+//! 1.0.0-rc.2 adds forfeiture: `forfeit` on frozen accounts, before and after the 24 hours, with and
+//! without the permission and a case; thaws of forfeited accounts by the admin and by role holders,
+//! which must all fail; and `release_forfeiture` by the admin and by others. The checks also cover
+//! every forfeiture record, and that a forfeited account is always frozen (16).
+//!
 //! `FUZZ_CASES` (default 64), `FUZZ_STEPS` (default 60) and `FUZZ_SEED` (default fixed) set the run.
 //! A failure prints the seed, the case and the operations that led to it.
 
@@ -180,6 +185,20 @@ enum Op {
         outcome: u8,
         code: u16,
         role: RolePick,
+    },
+    /// `forfeit` wallet `account`'s token account under case `case` (an index into `CASES`).
+    Forfeit {
+        signer: Who,
+        account: usize,
+        case: usize,
+        code: u16,
+        role: RolePick,
+    },
+    /// `release_forfeiture` of wallet `account`'s token account.
+    ReleaseForfeiture {
+        signer: Who,
+        account: usize,
+        code: u16,
     },
     /// Move the cluster clock forward.
     Warp {
@@ -369,6 +388,8 @@ struct Model {
     freeze_records: Vec<Option<i64>>,
     /// Open seizures: (wallet, case index) -> amount burnt.
     seizures: BTreeMap<(usize, usize), u64>,
+    /// Forfeited accounts: the case index of each wallet's `ForfeitureRecord`.
+    forfeited: Vec<Option<usize>>,
 }
 
 impl Model {
@@ -563,10 +584,10 @@ fn random_amount(rng: &mut Rng, balance: u64, model: &Model) -> u64 {
         0 => 0,
         1 => 1,
         2 => balance,
-        3 => balance + 1,
+        3 => balance.saturating_add(1),
         4 if limit > 0 => limit,
         5 if limit > 0 => limit + 1,
-        _ => rng.below(balance.max(1) + 1),
+        _ => rng.below(balance.max(1).saturating_add(1)),
     }
 }
 
@@ -577,9 +598,49 @@ fn random_op(rng: &mut Rng, model: &Model, world: &World) -> Op {
     if model.pending.is_some() && rng.chance(10) {
         return random_accept(rng, model, world);
     }
+    // A wallet that holds the whole supply (u64::MAX) sends all of it: the hook gets the amount
+    // Token-2022 passes for a confidential transfer, the only way to reach the confidential limit
+    // rule here (the hook refuses a direct `Execute`, and LiteSVM makes no confidential proofs).
+    if let Some(from) = model.balances.iter().position(|b| *b == CONFIDENTIAL) {
+        if rng.chance(10) {
+            let to = (from + 1 + rng.below(WALLETS as u64 - 1) as usize) % WALLETS;
+            return Op::Transfer {
+                from,
+                to,
+                authority: Who::Wallet(from),
+                amount: CONFIDENTIAL,
+            };
+        }
+    }
     // The same for an open seizure, which only a few steps of a case ever see.
     if !model.seizures.is_empty() && rng.chance(8) {
         return random_close_seizure(rng, model, world);
+    }
+    // And for a forfeited account: someone tries to thaw it, or to release the forfeiture.
+    let forfeited: Vec<usize> = (0..WALLETS)
+        .filter(|i| model.forfeited[*i].is_some())
+        .collect();
+    if !forfeited.is_empty() && rng.chance(8) {
+        let account = forfeited[rng.below(forfeited.len() as u64) as usize];
+        let signer = match model.authority() {
+            Some(a) if rng.chance(50) => who_of(world, a),
+            _ => random_actor(rng, model, world),
+        };
+        return if rng.chance(60) {
+            Op::Freeze {
+                signer,
+                target: Target::Account(account),
+                thaw: true,
+                reason: random_reason(rng),
+                role: RolePick::Auto,
+            }
+        } else {
+            Op::ReleaseForfeiture {
+                signer,
+                account,
+                code: rng.below(8) as u16,
+            }
+        };
     }
     // And for a role holder unblocking a blocked wallet, where BLOCK must not stand in for UNBLOCK.
     if !model.block.is_empty() && !model.roles.is_empty() && rng.chance(5) {
@@ -593,7 +654,7 @@ fn random_op(rng: &mut Rng, model: &Model, world: &World) -> Op {
             role: RolePick::Auto,
         };
     }
-    match rng.below(150) {
+    match rng.below(158) {
         0..=29 => {
             let from = wallet(rng);
             let to = if rng.chance(10) { from } else { wallet(rng) };
@@ -672,7 +733,7 @@ fn random_op(rng: &mut Rng, model: &Model, world: &World) -> Op {
             Op::Approve {
                 owner,
                 delegate,
-                amount: rng.below(model.balances[owner] + 2),
+                amount: rng.below(model.balances[owner].saturating_add(2)),
             }
         }
         47..=53 => Op::UpdatePolicy {
@@ -926,6 +987,44 @@ fn random_op(rng: &mut Rng, model: &Model, world: &World) -> Op {
             }
         }
         141..=143 => random_close_seizure(rng, model, world),
+        150..=155 => {
+            // Like a seizure: mostly an account frozen through Vigilantis, sometimes right at the
+            // 24-hour boundary and by the admin.
+            let frozen: Vec<usize> = (0..WALLETS).filter(|i| model.frozen[*i]).collect();
+            let t = now(&world.svm);
+            let at_boundary: Vec<usize> = frozen
+                .iter()
+                .copied()
+                .filter(|i| model.freeze_records[*i].map(|f| f + SEIZE_DELAY_SECONDS) == Some(t))
+                .collect();
+            let account = if !at_boundary.is_empty() && rng.chance(60) {
+                at_boundary[rng.below(at_boundary.len() as u64) as usize]
+            } else if !frozen.is_empty() && rng.chance(80) {
+                frozen[rng.below(frozen.len() as u64) as usize]
+            } else {
+                wallet(rng)
+            };
+            let signer = match model.authority() {
+                Some(a) if rng.chance(40) => who_of(world, a),
+                _ => random_actor(rng, model, world),
+            };
+            Op::Forfeit {
+                signer,
+                account,
+                case: if rng.chance(10) {
+                    0
+                } else {
+                    1 + rng.below(2) as usize
+                },
+                code: rng.below(8) as u16,
+                role: random_role_pick(rng, model, world),
+            }
+        }
+        156..=157 => Op::ReleaseForfeiture {
+            signer: random_actor(rng, model, world),
+            account: wallet(rng),
+            code: rng.below(8) as u16,
+        },
         _ => {
             // Sometimes exactly to the second a frozen account becomes seizable, so that a seizure
             // lands on the boundary of the 24 hours.
@@ -1204,6 +1303,13 @@ fn step(world: &mut World, model: &mut Model, op: &Op) -> Result<Expect, String>
                 }
                 Some(_) if matches!(target, Target::Policy) => Expect::Err,
                 Some(_) if !model.allowed(s, holder, needed) => Expect::Code(code::UNAUTHORIZED),
+                // A forfeited account cannot be thawed, by anyone (invariant 16).
+                Some(_)
+                    if thaw
+                        && matches!(target, Target::Account(i) if model.forfeited[i].is_some()) =>
+                {
+                    Expect::Code(code::ACCOUNT_FORFEITED)
+                }
                 Some(_) => match target {
                     Target::Account(i) if model.frozen[i] == !thaw => {
                         Expect::Code(token_code::INVALID_STATE)
@@ -1647,6 +1753,97 @@ fn step(world: &mut World, model: &mut Model, op: &Op) -> Result<Expect, String>
             );
             (expect, vec![ix], vec![signer])
         }
+        Op::Forfeit {
+            signer,
+            account,
+            case,
+            code: reason_code,
+            role,
+        } => {
+            let s = world.key(signer);
+            let holder = model.role_holder(world, role, s);
+            let reason = Reason {
+                code: reason_code,
+                case_ref: CASES[case],
+            };
+            let earliest = model.freeze_records[account].map(|t| t + SEIZE_DELAY_SECONDS);
+            // Loading: the policy, the freeze record, the new forfeiture record, the role entry.
+            // Then the mint's freeze authority (a constraint). Then, in the instruction: the
+            // permission, the case reference, the account's state and the delay.
+            let expect = match model.policy {
+                _ if !signer_ok(signer) => Expect::Err,
+                None => Expect::Err,
+                Some(_) if model.freeze_records[account].is_none() => {
+                    Expect::Code(anchor_code::ACCOUNT_NOT_INITIALIZED)
+                }
+                Some(_) if model.forfeited[account].is_some() => Expect::Err,
+                Some(_) if model.role_missing(holder) => {
+                    Expect::Code(anchor_code::ACCOUNT_NOT_INITIALIZED)
+                }
+                Some(_) if model.freeze_authority != Some(vigilantis_freeze) => {
+                    Expect::Code(code::FREEZE_AUTHORITY_NOT_VIGILANTIS)
+                }
+                Some(_) if !model.allowed(s, holder, perm::SEIZE) => {
+                    Expect::Code(code::UNAUTHORIZED)
+                }
+                Some(_) if case == 0 => Expect::Code(code::INVALID_CASE_REF),
+                Some(_) if !model.frozen[account] => Expect::Code(code::ACCOUNT_NOT_FROZEN),
+                Some(_) if earliest.is_some_and(|t| now(&world.svm) < t) => {
+                    Expect::Code(code::SEIZE_TOO_EARLY)
+                }
+                Some(_) => Expect::Ok,
+            };
+            if expect == Expect::Ok {
+                model.forfeited[account] = Some(case);
+                events.push(Enforcement {
+                    mint,
+                    wallet: world.wallets[account].pubkey(),
+                    token_account: world.accounts[account],
+                    action: Action::Forfeit,
+                    reason,
+                    authority: s,
+                });
+            }
+            let ix = ix::with_role(
+                ix::forfeit(s, mint, world.accounts[account], reason, [0; 32]),
+                role_account(world, holder),
+            );
+            (expect, vec![ix], vec![signer])
+        }
+        Op::ReleaseForfeiture {
+            signer,
+            account,
+            code: reason_code,
+        } => {
+            let s = world.key(signer);
+            // Loading: the policy, then the forfeiture record. Then the policy's authority (a
+            // constraint): the admin only, never a role.
+            let expect = match model.policy {
+                _ if !signer_ok(signer) => Expect::Err,
+                None => Expect::Err,
+                Some(_) if model.forfeited[account].is_none() => {
+                    Expect::Code(anchor_code::ACCOUNT_NOT_INITIALIZED)
+                }
+                Some((a, _)) if a != s => Expect::Code(code::UNAUTHORIZED),
+                Some(_) => Expect::Ok,
+            };
+            if expect == Expect::Ok {
+                let case = model.forfeited[account].take().expect("forfeited");
+                events.push(Enforcement {
+                    mint,
+                    wallet: world.wallets[account].pubkey(),
+                    token_account: world.accounts[account],
+                    action: Action::ReleaseForfeiture,
+                    reason: Reason {
+                        code: reason_code,
+                        case_ref: CASES[case],
+                    },
+                    authority: s,
+                });
+            }
+            let ix = ix::release_forfeiture(s, mint, world.accounts[account], reason_code);
+            (expect, vec![ix], vec![signer])
+        }
         Op::Warp { seconds } => {
             advance_clock(&mut world.svm, seconds);
             return check_state(world, model).map(|()| Expect::Ok);
@@ -1979,6 +2176,17 @@ fn check_state(world: &World, model: &Model) -> Result<(), String> {
                 model.freeze_records[i]
             ));
         }
+        let forfeiture = read_forfeiture(svm, &mint, account).map(|(case_ref, _, _)| case_ref);
+        let expected = model.forfeited[i].map(|case| CASES[case]);
+        if forfeiture != expected {
+            return Err(format!(
+                "wallet {i}: forfeiture {forfeiture:?}, model {expected:?}"
+            ));
+        }
+        // Invariant 16: a forfeited account is frozen.
+        if forfeiture.is_some() && !is_frozen(svm, account) {
+            return Err(format!("wallet {i}: forfeited but not frozen"));
+        }
         for (case, case_ref) in CASES.iter().enumerate() {
             let seizure = read_seizure(svm, &mint, account, case_ref);
             let expected = model.seizures.get(&(i, case)).copied();
@@ -2061,10 +2269,17 @@ fn setup(rng: &mut Rng) -> (World, Model, Vec<Op>) {
         permanent_delegate: delegate,
         delegate_is_vigilantis,
         freeze_records: vec![None; WALLETS],
+        forfeited: vec![None; WALLETS],
         ..Model::default()
     };
+    // In a few cases wallet 0 holds the whole supply, u64::MAX base units (see `random_op`).
+    let whole_supply = rng.chance(8);
     for (i, account) in accounts.iter().enumerate() {
-        let amount = rng.below(1_000);
+        let amount = match (whole_supply, i) {
+            (true, 0) => CONFIDENTIAL,
+            (true, _) => 0,
+            _ => rng.below(1_000),
+        };
         if amount > 0 {
             mint_to(&mut svm, &issuer, &mint, account, amount);
         }

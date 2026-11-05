@@ -8,7 +8,7 @@ export type Vigilantis = {
   "address": "4DoDFZJmJWYuBx86UqXi3y24GkQ3Cq4nUBHZwDE5PQM5",
   "metadata": {
     "name": "vigilantis",
-    "version": "1.0.0-rc.1",
+    "version": "1.0.0-rc.2",
     "spec": "0.1.0",
     "description": "Programmable compliance for Token-2022 tokenized assets, built on Transfer Hooks."
   },
@@ -576,6 +576,214 @@ export type Vigilantis = {
       ]
     },
     {
+      "name": "forfeit",
+      "docs": [
+        "End a case whose funds cannot be seized: the token account stays frozen for good. The",
+        "admin, or a holder of `permission::SEIZE`; `case_ref` must not be all zeros.",
+        "",
+        "This is for a balance that `seize` cannot reach, above all a confidential one, which only its",
+        "owner's proofs can move. The account must have been frozen through Vigilantis at least",
+        "`SEIZE_DELAY_SECONDS` before and still be frozen. Vigilantis then keeps a `ForfeitureRecord`",
+        "for it, and `thaw_token_account` refuses the account for as long as the record exists; only",
+        "the admin can remove it, with `release_forfeiture` (for example after an appeal). Nothing is",
+        "burnt or moved: the tokens stay in the supply, and the issuer reports them apart from the",
+        "supply in circulation.",
+        "",
+        "`amount_commitment` is the issuer's own and optional (all zeros for none), for example",
+        "SHA-256 of a salt and the amount its auditor key shows, so that the amount can be proven later",
+        "without putting it on-chain. Vigilantis does not check it."
+      ],
+      "discriminator": [
+        80,
+        154,
+        237,
+        158,
+        244,
+        198,
+        154,
+        9
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "docs": [
+            "The admin or a role holder; pays for the `ForfeitureRecord`."
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "policyConfig",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  108,
+                  105,
+                  99,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "tokenAccount"
+        },
+        {
+          "name": "freezeRecord",
+          "docs": [
+            "When Vigilantis froze `token_account`; without one, the account cannot be forfeited."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  114,
+                  101,
+                  101,
+                  122,
+                  101,
+                  45,
+                  114,
+                  101,
+                  99,
+                  111,
+                  114,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              },
+              {
+                "kind": "account",
+                "path": "tokenAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "forfeitureRecord",
+          "docs": [
+            "One per token account: a second `forfeit` of the same account fails."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  111,
+                  114,
+                  102,
+                  101,
+                  105,
+                  116,
+                  117,
+                  114,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              },
+              {
+                "kind": "account",
+                "path": "tokenAccount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "freezeAuthority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  114,
+                  101,
+                  101,
+                  122,
+                  101,
+                  45,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+        },
+        {
+          "name": "systemProgram",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "role",
+          "docs": [
+            "The signer's `RoleEntry` for this mint, when the signer is not the admin."
+          ],
+          "optional": true
+        }
+      ],
+      "args": [
+        {
+          "name": "reasonCode",
+          "type": "u16"
+        },
+        {
+          "name": "caseRef",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "amountCommitment",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        }
+      ]
+    },
+    {
       "name": "freezeTokenAccount",
       "docs": [
         "Freeze one token account of the mint: Token-2022 then refuses every instruction on it",
@@ -714,6 +922,39 @@ export type Vigilantis = {
         {
           "name": "systemProgram",
           "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "forfeitureRecord",
+          "docs": [
+            "a thaw is refused (`require_not_forfeited`). A freeze does not read it."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  111,
+                  114,
+                  102,
+                  101,
+                  105,
+                  116,
+                  117,
+                  114,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              },
+              {
+                "kind": "account",
+                "path": "tokenAccount"
+              }
+            ]
+          }
         },
         {
           "name": "role",
@@ -1173,6 +1414,102 @@ export type Vigilantis = {
         {
           "name": "newAuthority",
           "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "releaseForfeiture",
+      "docs": [
+        "Remove a `ForfeitureRecord`, for example when a court lifts the forfeiture on appeal, so that",
+        "the account can be thawed again. The admin only, never a role holder: this is the one way",
+        "back from `forfeit`. The record's rent goes to the admin; the events of the forfeiture and of",
+        "its release stay in the chain's history. The account stays frozen until a",
+        "`thaw_token_account`."
+      ],
+      "discriminator": [
+        99,
+        218,
+        93,
+        72,
+        16,
+        230,
+        190,
+        131
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "docs": [
+            "The admin; gets the record's rent."
+          ],
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "policyConfig"
+          ]
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "policyConfig",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  108,
+                  105,
+                  99,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "forfeitureRecord",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  111,
+                  114,
+                  102,
+                  101,
+                  105,
+                  116,
+                  117,
+                  114,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              },
+              {
+                "kind": "account",
+                "path": "forfeiture_record.token_account",
+                "account": "forfeitureRecord"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "reasonCode",
+          "type": "u16"
         }
       ]
     },
@@ -2045,7 +2382,8 @@ export type Vigilantis = {
       "docs": [
         "Thaw a token account frozen with `freeze_token_account` (or by any earlier holder of the",
         "mint's freeze authority). The admin, or a holder of `permission::THAW`. Deletes the",
-        "account's `FreezeRecord`, if there is one, and returns its rent to the signer."
+        "account's `FreezeRecord`, if there is one, and returns its rent to the signer. Refused while",
+        "the account has a `ForfeitureRecord` (`AccountForfeited`), the admin's thaw included."
       ],
       "discriminator": [
         199,
@@ -2175,6 +2513,39 @@ export type Vigilantis = {
         {
           "name": "systemProgram",
           "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "forfeitureRecord",
+          "docs": [
+            "a thaw is refused (`require_not_forfeited`). A freeze does not read it."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  111,
+                  114,
+                  102,
+                  101,
+                  105,
+                  116,
+                  117,
+                  114,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              },
+              {
+                "kind": "account",
+                "path": "tokenAccount"
+              }
+            ]
+          }
         },
         {
           "name": "role",
@@ -2679,6 +3050,19 @@ export type Vigilantis = {
       ]
     },
     {
+      "name": "forfeitureRecord",
+      "discriminator": [
+        106,
+        182,
+        173,
+        239,
+        177,
+        244,
+        0,
+        118
+      ]
+    },
+    {
       "name": "freezeRecord",
       "discriminator": [
         33,
@@ -2795,6 +3179,32 @@ export type Vigilantis = {
         176,
         40,
         223
+      ]
+    },
+    {
+      "name": "forfeited",
+      "discriminator": [
+        80,
+        140,
+        117,
+        204,
+        15,
+        230,
+        158,
+        241
+      ]
+    },
+    {
+      "name": "forfeitureReleased",
+      "discriminator": [
+        129,
+        199,
+        0,
+        212,
+        189,
+        242,
+        241,
+        76
       ]
     },
     {
@@ -3020,7 +3430,7 @@ export type Vigilantis = {
     {
       "code": 6015,
       "name": "invalidCaseRef",
-      "msg": "A seizure needs a case reference"
+      "msg": "A seizure or a forfeiture needs a case reference"
     },
     {
       "code": 6016,
@@ -3041,6 +3451,11 @@ export type Vigilantis = {
       "code": 6019,
       "name": "pausedMintHandover",
       "msg": "Resume the mint before handing on or giving up its pause authority"
+    },
+    {
+      "code": 6020,
+      "name": "accountForfeited",
+      "msg": "The token account is forfeited; the admin must release the forfeiture before it can be thawed"
     }
   ],
   "types": [
@@ -3154,7 +3569,8 @@ export type Vigilantis = {
       "name": "enforcementAction",
       "docs": [
         "Emitted by `block_wallet`, `unblock_wallet`, `freeze_token_account`, `thaw_token_account`,",
-        "`pause`, `resume`, `seize` and `close_seizure`: what was done, to whom, and the issuer's reason. Vigilantis does not interpret `reason_code`;",
+        "`pause`, `resume`, `seize`, `close_seizure`, `forfeit` and `release_forfeiture`: what was done,",
+        "to whom, and the issuer's reason. Vigilantis does not interpret `reason_code`;",
         "`case_ref` points to the issuer's own case file (for example a salted hash of its case number),",
         "so no personal data needs to go on-chain."
       ],
@@ -3168,16 +3584,16 @@ export type Vigilantis = {
           {
             "name": "wallet",
             "docs": [
-              "The blocked or unblocked wallet, or the owner of the frozen, thawed or seized token account;",
-              "the default address for a pause or resume."
+              "The blocked or unblocked wallet, or the owner of the frozen, thawed, seized or forfeited",
+              "token account; the default address for a pause or resume."
             ],
             "type": "pubkey"
           },
           {
             "name": "tokenAccount",
             "docs": [
-              "The frozen, thawed or seized token account; the default address for a block, unblock, pause",
-              "or resume."
+              "The frozen, thawed, seized or forfeited token account; the default address for a block,",
+              "unblock, pause or resume."
             ],
             "type": "pubkey"
           },
@@ -3240,6 +3656,181 @@ export type Vigilantis = {
           },
           {
             "name": "closeSeizure"
+          },
+          {
+            "name": "forfeit"
+          },
+          {
+            "name": "releaseForfeiture"
+          }
+        ]
+      }
+    },
+    {
+      "name": "forfeited",
+      "docs": [
+        "Emitted by `forfeit`, next to `EnforcementAction`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "wallet",
+            "type": "pubkey"
+          },
+          {
+            "name": "tokenAccount",
+            "type": "pubkey"
+          },
+          {
+            "name": "reasonCode",
+            "type": "u16"
+          },
+          {
+            "name": "caseRef",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "amountCommitment",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "forfeitedAt",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "forfeitureRecord",
+      "docs": [
+        "A token account frozen for good at the end of a case, because its balance (typically a",
+        "confidential one) could not be seized. Written by `forfeit`, removed only by the admin's",
+        "`release_forfeiture`; while it exists, `thaw_token_account` refuses the account."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "wallet",
+            "docs": [
+              "The owner of the token account at the time of the forfeiture."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "tokenAccount",
+            "type": "pubkey"
+          },
+          {
+            "name": "reasonCode",
+            "type": "u16"
+          },
+          {
+            "name": "caseRef",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "amountCommitment",
+            "docs": [
+              "The issuer's commitment to the amount, for example SHA-256 of a salt and the amount, or all",
+              "zeros. Vigilantis does not check it."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "authority",
+            "docs": [
+              "Who recorded the forfeiture."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "forfeitedAt",
+            "docs": [
+              "Unix time of the forfeiture."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "slot",
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "forfeitureReleased",
+      "docs": [
+        "Emitted by `release_forfeiture`, next to `EnforcementAction`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "wallet",
+            "type": "pubkey"
+          },
+          {
+            "name": "tokenAccount",
+            "type": "pubkey"
+          },
+          {
+            "name": "caseRef",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "reasonCode",
+            "type": "u16"
+          },
+          {
+            "name": "authority",
+            "type": "pubkey"
           }
         ]
       }

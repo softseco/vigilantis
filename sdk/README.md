@@ -3,10 +3,11 @@
 TypeScript SDK for **Vigilantis** — programmable compliance for Token-2022 tokenized assets, built on
 the Transfer Hook extension. Create a compliant mint, set a policy (allowlist, blocklist, transfer
 limit), manage entries, freeze and thaw accounts with the reason recorded, pause the token, seize a
-frozen account's balance under a court order, give compliance officers roles, and move tokens
+frozen account's balance under a court order or record a forfeiture where it cannot be seized, give
+compliance officers roles, and move tokens
 through the hook — in a handful of async calls.
 
-> **Status: 1.0.0-rc.1**, the release candidate for an independent audit, continuing
+> **Status: 1.0.0-rc.2**, the release candidate for an independent audit, continuing
 > `@softseco/sentinel` 2.3.0 under a new name. Self-audited, not independently audited. The program
 > ID in the IDL is `4DoDFZJmJWYuBx86UqXi3y24GkQ3Cq4nUBHZwDE5PQM5` (devnet, from its first deployment there).
 > Built by Softseco.
@@ -128,6 +129,16 @@ Since 1.0 (see "Roles", "Pause" and "Seizure" below):
   builders are now async: when the signer is not the policy authority, they look up its role entry
   and pass it
 
+Since 1.0.0-rc.2 (see "Forfeiture" below):
+
+- `forfeit(mint, tokenAccount, why, amountCommitment?)`, `releaseForfeiture(mint, tokenAccount, reasonCode)`,
+  `getForfeiture(mint, tokenAccount)`, `listForfeitures(mint)`, `forfeitedAmong(mint, tokenAccounts)`,
+  `amountCommitment(amount, salt)`
+- Builders: `forfeitInstruction`, `releaseForfeitureInstruction`; PDA helper: `forfeitureRecord`
+- Events: `forfeited`, `forfeitureReleased` in `parseEvents`, and `forfeit` and `releaseForfeiture`
+  as `enforcementAction` kinds
+- `thawWallet` leaves forfeited accounts frozen and thaws the rest
+
 ## Policy authority held by a multisig
 
 The `VigilantisClient` methods sign with the provider wallet. When the policy authority is a
@@ -167,10 +178,12 @@ npx vigilantis role grant <mint> <officer> --permissions block,unblock,freeze,th
 - **RPC and signer:** `--url` (a URL, or `mainnet-beta`, `devnet`, `localhost`) and `--keypair`;
   without them, `VIGILANTIS_RPC_URL` and then the Solana CLI config. Keep an RPC URL with an API key
   in the environment or the config, not on the command line.
-- **Why:** freeze, thaw, pause, resume, seize and handing the freeze or pause authority on need
-  `--reason` (`sanctions`, `court-order`, `fraud`, ... or a number). `--case <id>` adds a case
-  reference, hashed with a salt from `VIGILANTIS_CASE_SALT` or `--case-salt-file`; the salt never
-  goes on the command line. `vigilantis case-ref <id>` prints the hash.
+- **Why:** `--reason` (`sanctions`, `court-order`, `fraud`, ... or a number) and `--case <id>` are
+  recorded with the action. They are optional, so a freeze, a block or a pause during an incident
+  never waits for paperwork; give them whenever you can, because they cannot be added afterwards.
+  `seize` and `forfeit` need both; `seizure close` and `forfeiture release` need a reason. The case
+  is hashed with a salt from `VIGILANTIS_CASE_SALT` or `--case-salt-file`; the salt never goes on
+  the command line. `vigilantis case-ref <id>` prints the hash.
 - **Multisig:** `--multisig <vault>` sends nothing and needs no keypair. It prints each transaction
   in base58, with the vault as signer, for Squads ("Add instruction", then "Import base58 encoded
   tx"). Long lists are split so each transaction leaves the multisig room for its own wrapper.
@@ -298,6 +311,33 @@ issuer's own step. Tokens held confidentially are encrypted and cannot be seized
 
 The seizure stays open in a `SeizureRecord` (`getSeizure`, `listSeizures`) until `closeSeizure`
 records how it ended: `returnedToOwner`, `paidToVictim`, `paidToState` or `other`.
+
+## Forfeiture
+
+A confidential balance cannot be seized, and a case can end with nothing to burn. `forfeit` closes
+such a case on the record: the account, frozen through Vigilantis at least 24 hours before, gets a
+`ForfeitureRecord`, and from then on no thaw gets past it, whoever signs. Nothing is burnt or
+moved; the tokens stay in the supply, and the issuer reports them apart from the supply in
+circulation.
+
+```ts
+import { amountCommitment } from "@softseco/vigilantis";
+
+// The amount, worked out with the auditor key, committed to without making it public:
+const commitment = amountCommitment(forfeitedAmount, secretAmountSalt);
+await client.forfeit(mint.publicKey, tokenAccount, order, commitment);
+
+await client.getForfeiture(mint.publicKey, tokenAccount); // { caseRef, amountCommitment, forfeitedAt, ... }
+await client.listForfeitures(mint.publicKey);
+
+// After an appeal, the admin (never a role) releases it; a thaw then works again:
+await client.releaseForfeiture(mint.publicKey, tokenAccount, ENFORCEMENT_REASONS.caseClosed);
+```
+
+A role with `seize` can forfeit. Only the policy authority releases a forfeiture, so keep that key
+in a multisig. Forfeiture is per token account; the wallet's blocklist entry keeps it from using a
+new one. Vigilantis does not check the commitment: it is SHA-256 of the salt and the amount as eight
+little-endian bytes, which the issuer can open to a court or an auditor by showing both.
 
 ## Confidential transfers
 

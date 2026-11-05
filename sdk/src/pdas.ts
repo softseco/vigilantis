@@ -40,6 +40,7 @@ export const PAUSE_AUTHORITY_SEED = Buffer.from("pause-authority");
 export const PERMANENT_DELEGATE_SEED = Buffer.from("permanent-delegate");
 export const FREEZE_RECORD_SEED = Buffer.from("freeze-record");
 export const SEIZURE_SEED = Buffer.from("seizure");
+export const FORFEITURE_SEED = Buffer.from("forfeiture");
 
 /** A role holder's `RoleEntry` for a mint (`["role", mint, holder]`). */
 export const rolePda = (mint: PublicKey, holder: PublicKey, programId: PublicKey): PublicKey =>
@@ -74,3 +75,7 @@ export const seizureRecordPda = (
     [SEIZURE_SEED, mint.toBuffer(), tokenAccount.toBuffer(), Buffer.from(Uint8Array.from(caseRef))],
     programId,
   )[0];
+
+/** A token account frozen for good at the end of a case (`["forfeiture", mint, tokenAccount]`). */
+export const forfeitureRecordPda = (mint: PublicKey, tokenAccount: PublicKey, programId: PublicKey): PublicKey =>
+  PublicKey.findProgramAddressSync([FORFEITURE_SEED, mint.toBuffer(), tokenAccount.toBuffer()], programId)[0];

@@ -32,6 +32,7 @@ import type { Vigilantis } from "./idl/vigilantis";
 import {
   allowEntryPda,
   blockEntryPda,
+  forfeitureRecordPda,
   freezeAuthorityPda,
   freezeRecordPda,
   metaListPda,
@@ -134,6 +135,21 @@ export function caseRef(caseId: string, salt: string | Uint8Array): Uint8Array {
 }
 
 /**
+ * A 32-byte commitment to a forfeited amount, for `forfeit`: SHA-256 of `salt` followed by the
+ * amount in base units as 8 bytes, little-endian. Use a salt kept apart from the case salt, so the
+ * commitment says nothing without it; with it, the issuer can later prove the amount (which its
+ * auditor key shows) to a supervisor without the amount ever going on-chain.
+ */
+export function amountCommitment(amount: bigint | number, salt: string | Uint8Array): Uint8Array {
+  const value = BigInt(amount);
+  if (value < 0n || value > 0xffffffffffffffffn) throw new Error(`amount must fit in a u64, got ${value}`);
+  const saltBytes = typeof salt === "string" ? Buffer.from(salt, "utf8") : Buffer.from(salt);
+  const le = Buffer.alloc(8);
+  le.writeBigUInt64LE(value);
+  return sha256(Buffer.concat([saltBytes, le]));
+}
+
+/**
  * The permissions a role can hold (bits of `RoleView.permissions`). Combine them with `|`. The policy
  * authority (the admin) can always do everything; only the admin manages roles, the policy and the
  * authorities.
@@ -153,7 +169,7 @@ export const PERMISSIONS = {
   pause: 1 << 5,
   /** `resume`. */
   resume: 1 << 6,
-  /** `seize`. */
+  /** `seize` and `forfeit`. */
   seize: 1 << 7,
   /** `close_seizure`. */
   closeSeizure: 1 << 8,
@@ -204,6 +220,26 @@ export interface SeizureView {
   authority: PublicKey;
   /** Unix time of the seizure, in seconds. */
   seizedAt: number;
+  slot: bigint;
+}
+
+/**
+ * A token account frozen for good at the end of a case (`forfeit`), until the admin's
+ * `release_forfeiture`. While it exists, the account cannot be thawed.
+ */
+export interface ForfeitureView {
+  address: PublicKey;
+  mint: PublicKey;
+  /** The owner of the token account at the time of the forfeiture. */
+  wallet: PublicKey;
+  tokenAccount: PublicKey;
+  reasonCode: number;
+  caseRef: Uint8Array;
+  /** The issuer's commitment to the amount (for example `amountCommitment(...)`), or all zeros. */
+  amountCommitment: Uint8Array;
+  authority: PublicKey;
+  /** Unix time of the forfeiture, in seconds. */
+  forfeitedAt: number;
   slot: bigint;
 }
 
@@ -296,6 +332,10 @@ export class VigilantisClient {
   /** The `SeizureRecord` address of a seizure. */
   seizureRecord(mint: PublicKey, tokenAccount: PublicKey, caseRef: Uint8Array | number[]): PublicKey {
     return seizureRecordPda(mint, tokenAccount, caseRef, this.programId);
+  }
+  /** The `ForfeitureRecord` address of a token account. */
+  forfeitureRecord(mint: PublicKey, tokenAccount: PublicKey): PublicKey {
+    return forfeitureRecordPda(mint, tokenAccount, this.programId);
   }
 
   private get connection() {
@@ -652,8 +692,9 @@ export class VigilantisClient {
 
   /**
    * `freeze_token_account` or `thaw_token_account` for one token account, signed by `authority`. A
-   * freeze also writes the account's `FreezeRecord` (the signer pays its rent), which `seize` needs;
-   * a thaw deletes it and returns the rent to the signer.
+   * freeze also writes the account's `FreezeRecord` (the signer pays its rent), which `seize` and
+   * `forfeit` need; a thaw deletes it and returns the rent to the signer. A thaw of a forfeited
+   * account fails (`AccountForfeited`).
    */
   async freezeInstruction(params: {
     mint: PublicKey;
@@ -674,6 +715,7 @@ export class VigilantisClient {
       tokenProgram: TOKEN_2022_PROGRAM_ID,
       freezeRecord: this.freezeRecord(mint, params.tokenAccount),
       systemProgram: SystemProgram.programId,
+      forfeitureRecord: this.forfeitureRecord(mint, params.tokenAccount),
       role: await this.roleAccount(mint, authority),
     };
     return params.thaw
@@ -749,10 +791,31 @@ export class VigilantisClient {
     return this.freezeBatch(mint, accounts.map((a) => a.address), enforcement, false);
   }
 
-  /** Thaw every frozen token account of `mint` that `owner` holds. */
+  /**
+   * Thaw every frozen token account of `mint` that `owner` holds, except forfeited ones, which
+   * cannot be thawed until the admin releases the forfeiture.
+   */
   async thawWallet(mint: PublicKey, owner: PublicKey, enforcement: Enforcement): Promise<string[]> {
-    const accounts = (await this.tokenAccountsOf(mint, owner)).filter((a) => a.frozen);
-    return this.freezeBatch(mint, accounts.map((a) => a.address), enforcement, true);
+    const frozen = (await this.tokenAccountsOf(mint, owner)).filter((a) => a.frozen).map((a) => a.address);
+    const forfeited = await this.forfeitedAmong(mint, frozen);
+    const accounts = frozen.filter((a) => !forfeited.has(a.toBase58()));
+    return this.freezeBatch(mint, accounts, enforcement, true);
+  }
+
+  /** Which of `tokenAccounts` have a `ForfeitureRecord`, as base58 addresses. */
+  async forfeitedAmong(mint: PublicKey, tokenAccounts: PublicKey[]): Promise<Set<string>> {
+    const forfeited = new Set<string>();
+    for (let i = 0; i < tokenAccounts.length; i += 100) {
+      const chunk = tokenAccounts.slice(i, i + 100);
+      const infos = await this.connection.getMultipleAccountsInfo(
+        chunk.map((a) => this.forfeitureRecord(mint, a)),
+        "confirmed",
+      );
+      infos.forEach((info, j) => {
+        if (info && info.owner.equals(this.programId) && info.data.length > 0) forfeited.add(chunk[j].toBase58());
+      });
+    }
+    return forfeited;
   }
 
   /**
@@ -1156,6 +1219,97 @@ export class VigilantisClient {
     return all.map(({ publicKey, account }) => seizureView(publicKey, account));
   }
 
+  // ---- Forfeiture ----
+
+  /**
+   * `forfeit`, signed by `authority` (the admin or a holder of `PERMISSIONS.seize`): end a case whose
+   * balance cannot be seized, typically a confidential one, and keep the token account frozen for
+   * good. The account must have been frozen through Vigilantis at least `SEIZE_DELAY_SECONDS` ago
+   * and still be frozen; `enforcement.caseRef` must not be all zeros. `amountCommitment` is
+   * optional (all zeros by default), for example `amountCommitment(amount, salt)`.
+   */
+  async forfeitInstruction(params: {
+    mint: PublicKey;
+    tokenAccount: PublicKey;
+    enforcement: Enforcement;
+    amountCommitment?: Uint8Array | number[];
+    authority?: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const { mint, tokenAccount } = params;
+    const authority = params.authority ?? this.payer.publicKey;
+    const [reasonCode, ref] = enforcementArgs(params.enforcement);
+    if (ref.every((b) => b === 0)) throw new Error("a forfeiture needs a case reference (caseRef is all zeros)");
+    const commitment = Array.from(params.amountCommitment ?? new Uint8Array(32));
+    if (commitment.length !== 32) throw new Error(`amountCommitment must be 32 bytes, got ${commitment.length}`);
+    return this.program.methods
+      .forfeit(reasonCode, ref, commitment)
+      .accountsPartial({
+        authority,
+        mint,
+        policyConfig: this.policy(mint),
+        tokenAccount,
+        freezeRecord: this.freezeRecord(mint, tokenAccount),
+        forfeitureRecord: this.forfeitureRecord(mint, tokenAccount),
+        freezeAuthority: this.freezeAuthority(mint),
+        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+        role: await this.roleAccount(mint, authority),
+      })
+      .instruction();
+  }
+
+  /**
+   * `release_forfeiture`, signed by the admin (never a role holder): remove a token account's
+   * `ForfeitureRecord`, for example after an appeal, so that it can be thawed. The account stays
+   * frozen until a thaw.
+   */
+  releaseForfeitureInstruction(params: {
+    mint: PublicKey;
+    tokenAccount: PublicKey;
+    reasonCode: number;
+    authority?: PublicKey;
+  }): Promise<TransactionInstruction> {
+    const { mint } = params;
+    const [reasonCode] = enforcementArgs({ reasonCode: params.reasonCode, caseRef: new Uint8Array(32) });
+    return this.program.methods
+      .releaseForfeiture(reasonCode)
+      .accountsPartial({
+        authority: params.authority ?? this.payer.publicKey,
+        mint,
+        policyConfig: this.policy(mint),
+        forfeitureRecord: this.forfeitureRecord(mint, params.tokenAccount),
+      })
+      .instruction();
+  }
+
+  /** Forfeit a frozen token account (provider wallet as the admin or a role holder). */
+  async forfeit(
+    mint: PublicKey,
+    tokenAccount: PublicKey,
+    enforcement: Enforcement,
+    amountCommitment?: Uint8Array | number[],
+  ): Promise<string> {
+    return this.send([await this.forfeitInstruction({ mint, tokenAccount, enforcement, amountCommitment })]);
+  }
+
+  /** Release a forfeiture (provider wallet as the admin). */
+  async releaseForfeiture(mint: PublicKey, tokenAccount: PublicKey, reasonCode: number): Promise<string> {
+    return this.send([await this.releaseForfeitureInstruction({ mint, tokenAccount, reasonCode })]);
+  }
+
+  /** A token account's forfeiture, or `null` if it has none. */
+  async getForfeiture(mint: PublicKey, tokenAccount: PublicKey): Promise<ForfeitureView | null> {
+    const address = this.forfeitureRecord(mint, tokenAccount);
+    const acc = await this.program.account.forfeitureRecord.fetchNullable(address);
+    return acc ? forfeitureView(address, acc) : null;
+  }
+
+  /** Every forfeited token account of `mint`. */
+  async listForfeitures(mint: PublicKey): Promise<ForfeitureView[]> {
+    const all = await this.program.account.forfeitureRecord.all([{ memcmp: { offset: 8, bytes: mint.toBase58() } }]);
+    return all.map(({ publicKey, account }) => forfeitureView(publicKey, account));
+  }
+
   // ---- Authority handover (provider wallet as the current authority) ----
 
   /** Propose `newAuthority` as the policy authority. Nothing changes until it accepts. */
@@ -1351,6 +1505,35 @@ function seizureView(
     caseRef: Uint8Array.from(acc.caseRef),
     authority: acc.authority,
     seizedAt: Number(acc.seizedAt.toString()),
+    slot: BigInt(acc.slot.toString()),
+  };
+}
+
+/** A decoded `ForfeitureRecord`. */
+function forfeitureView(
+  address: PublicKey,
+  acc: {
+    mint: PublicKey;
+    wallet: PublicKey;
+    tokenAccount: PublicKey;
+    reasonCode: number;
+    caseRef: number[];
+    amountCommitment: number[];
+    authority: PublicKey;
+    forfeitedAt: { toString(): string };
+    slot: { toString(): string };
+  },
+): ForfeitureView {
+  return {
+    address,
+    mint: acc.mint,
+    wallet: acc.wallet,
+    tokenAccount: acc.tokenAccount,
+    reasonCode: acc.reasonCode,
+    caseRef: Uint8Array.from(acc.caseRef),
+    amountCommitment: Uint8Array.from(acc.amountCommitment),
+    authority: acc.authority,
+    forfeitedAt: Number(acc.forfeitedAt.toString()),
     slot: BigInt(acc.slot.toString()),
   };
 }

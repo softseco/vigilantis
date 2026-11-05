@@ -14,7 +14,7 @@ counts; this page says the same in plain words.
 - Softseco sets the terms of every commercial license, and may grant one at no charge. A young
   company can, for example, get a license that is free until it grows past an agreed size.
 - Each version becomes Apache-2.0 on its Change Date, four years after its release (for
-  1.0.0-rc.1: 2 November 2030).
+  1.0.0-rc.1: 3 November 2030).
 
 Sentinel, the earlier name of this program, stays available under Apache-2.0 up to 2.3.0 at
 github.com/softseco/sentinel.

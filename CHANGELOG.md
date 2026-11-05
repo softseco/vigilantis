@@ -5,6 +5,81 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The on-chain
 `@softseco/vigilantis` SDK are versioned together. Until 28 Oct 2026 the project was Sentinel
 (`@softseco/sentinel`, up to 2.3.0); that history is kept below, under Sentinel's version numbers.
 
+## [1.0.0-rc.2] - Unreleased
+
+Forfeiture, for a case that ends with a balance Vigilantis cannot seize, and reasons that are
+optional on the command line. A mint that never forfeits behaves as in 1.0.0-rc.1, but
+`freeze_token_account` and `thaw_token_account` take one more account (under Changed), so a client
+that builds them by hand must add it before the program is upgraded.
+
+### Added
+- **Forfeiture.** `forfeit` (the admin, or a role with SEIZE) creates a `ForfeitureRecord`
+  (`["forfeiture", mint, token_account]`, 219 bytes) for a token account that Vigilantis froze at
+  least 24 hours before (`SEIZE_DELAY_SECONDS`, as for a seizure), with a reason code, a case
+  reference (required) and an optional 32-byte `amount_commitment`. It burns and moves nothing:
+  the tokens stay in the supply. While the record exists, `thaw_token_account` refuses the
+  account, whoever signs, the admin included (`AccountForfeited`, 6020). `release_forfeiture`
+  (the admin only, never a role) closes the record and returns its rent to the admin. `Forfeited`
+  and `ForfeitureReleased` events, and `EnforcementAction` kinds `Forfeit` and
+  `ReleaseForfeiture` (appended, so the earlier values keep their numbers); the release carries
+  the case of its record. Invariant 16 in the threat model. The main use is a confidential
+  balance, which only its owner can move or burn: the case ends with the account frozen for good
+  and the amount, worked out with the auditor key, committed to on-chain without showing it.
+- **SDK:** `forfeit`, `releaseForfeiture`, `getForfeiture`, `listForfeitures`,
+  `forfeitedAmong(mint, tokenAccounts)`, the builders `forfeitInstruction` and
+  `releaseForfeitureInstruction`, `forfeitureRecord`, `forfeitureRecordPda`, `FORFEITURE_SEED`,
+  the `ForfeitureView` type, and `amountCommitment(amount, salt)`: SHA-256 of the salt and the
+  amount as eight little-endian bytes.
+- **Command line:** `forfeit <mint> <token-account> --reason --case [--amount-commitment <hex>]`,
+  `forfeiture release <mint> <token-account> --reason`, `forfeiture list <mint>`, and
+  `amount-commitment <amount>`, offline, with its own salt from `VIGILANTIS_AMOUNT_SALT` or
+  `--amount-salt-file`. `status` and `check` show forfeitures.
+- **Tests:** 5 more integration tests (96 in all: the refusals of an early forfeiture, one without
+  a case and one by a role without SEIZE, through the SDK and the command line; freezing and
+  thawing without a reason; the amount commitment); 2 more in LiteSVM (13), where the clock can
+  move 24 hours: a forfeiture, the refused thaws, the release and every refusal of `forfeit`. The
+  fuzz model generates forfeitures, releases and thaws of forfeited accounts, and checks every
+  forfeiture record and invariant 16 after every step, and in a few cases a wallet holds the whole
+  supply (`u64::MAX`) and sends all of it. 10 more planted bugs in `tests-fuzz/mutants.py`, 79 in
+  all, every one caught with 256 cases.
+
+### Changed
+- **`freeze_token_account` and `thaw_token_account` take the account's forfeiture-record address**
+  (`["forfeiture", mint, token_account]`, read-only, need not exist) before the optional role
+  entry: the thaw checks it, and the two instructions share their accounts. The SDK passes it.
+- **`thawWallet` and `vigilantis thaw <wallet>`** leave forfeited accounts frozen and thaw the
+  rest, with a warning; `vigilantis thaw <token-account>` refuses a forfeited account before
+  sending anything.
+- **Command line: `--reason` and `--case` are optional** for every command except `seize` and
+  `forfeit` (both needed) and `seizure close` and `forfeiture release` (a reason), so a freeze, a
+  block or a pause in an incident never waits for paperwork. Left out, the reason is recorded as
+  `unspecified` (0) and the case as all zeros. `block add --freeze` is always recorded as an
+  enforcement action, with or without a reason.
+- `InvalidCaseRef` now reads "A seizure or a forfeiture needs a case reference".
+- `sdk/package.json`: the `bin` path is written as npm normalises it (`dist/cli.js`), which ends
+  the warning `npm publish` printed.
+- **`docs/deployment.md`:** the forfeiture procedure; the suggested roles keep thaw, unblock and
+  resume with the multisig, next to seizure and forfeiture, and give the officer on duty block,
+  freeze and pause, which must work in seconds; the deployment record has its first row,
+  1.0.0-rc.1 on devnet (4 November 2026).
+- **`docs/audit-scope.md`**, **`docs/threat-model.md`**: forfeiture, invariant 16, the new limits
+  (a forfeited balance stays in the supply; handing the freeze authority away gets round a
+  forfeiture; a forfeiture covers one token account; a forfeited account can still be seized)
+  and the test counts. The audit scope's transfer costs are measured again: the hook's fixed part
+  is about 250 CU above the 17 October figures, from the two checks 1.0.0-rc.1 added.
+
+### Fixed
+- `tests-fuzz/mutants.py`: two mutants (`freeze-authority-to-vigilantis-allowed`,
+  `pause-authority-to-vigilantis-allowed`) no longer matched the program after finding 11, so the
+  script stopped before running any. They match again, and the seizure mutants now name the
+  function they change. The first full run since 1.0.0-rc.1 found two more that the fuzz tests
+  could no longer catch, because they reached them only through a direct `Execute`, which the hook
+  has refused since then: `confidential-limit-ignored` is now caught through a public transfer of
+  the whole supply, and `any-block-entry-blocks` is dropped, since it now behaves exactly like the
+  program.
+- `COMMERCIAL-LICENSE.md` gave 2 November 2030 as the Change Date of 1.0.0-rc.1; `LICENSE` says
+  2030-11-03, which is what counts.
+
 ## [1.0.0-rc.1] - 2026-11-03
 
 The release candidate for an independent audit, and the enforcement functions an issuer of a regulated token

@@ -24,7 +24,7 @@ import { assert } from "chai";
 import { mkdtempSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { VigilantisClient, caseRef } from "../sdk/src";
+import { VigilantisClient, amountCommitment, caseRef } from "../sdk/src";
 import { main } from "../sdk/src/cli";
 
 const CONFIRM = { commitment: "confirmed" as const };
@@ -152,7 +152,7 @@ describe("vigilantis — command line", () => {
   it("refuses a command line it cannot run, with exit code 2", async () => {
     const cases: [string[], RegExp][] = [
       [["launch", M], /unknown command/],
-      [["freeze", M, alice.publicKey.toBase58()], /--reason/],
+      [["seize", M, aliceAta.toBase58(), "--case", "CASE-4"], /--reason/],
       [["freeze", M, alice.publicKey.toBase58(), "--reason", "weather"], /unknown reason weather/],
       [["role", "list", M, "--reason", "fraud"], /--reason does not apply to `role list`/],
       [["policy", "update", M], /nothing to change/],
@@ -303,6 +303,46 @@ describe("vigilantis — command line", () => {
     assert.match(r.err, /SeizeTooEarly/);
     assert.equal((await ok(["seizure", "list", M])).out, "No open seizures.");
     await ok(["thaw", M, aliceAta.toBase58(), "--reason", "case-closed"]);
+  });
+
+  it("freezes and thaws at once without a reason or a case, recorded as unspecified", async () => {
+    await ok(["freeze", M, aliceAta.toBase58()]);
+    assert.isTrue(await sdk.isFrozen(aliceAta));
+    await ok(["thaw", M, aliceAta.toBase58()]);
+    assert.isFalse(await sdk.isFrozen(aliceAta));
+  });
+
+  it("refuses a forfeiture before the 24 hours have passed, or without a case", async () => {
+    await ok(["freeze", M, aliceAta.toBase58(), "--reason", "court-order", "--case", "CASE-5"]);
+    const noCase = await cli(["forfeit", M, aliceAta.toBase58(), "--reason", "court-order"]);
+    assert.equal(noCase.code, 2);
+    assert.match(noCase.err, /needs a case/);
+    const badCommitment = await cli(["forfeit", M, aliceAta.toBase58(), "--reason", "court-order", "--case", "CASE-5", "--amount-commitment", "12"]);
+    assert.equal(badCommitment.code, 2);
+    assert.match(badCommitment.err, /64 hex/);
+    const r = await cli(["forfeit", M, aliceAta.toBase58(), "--reason", "court-order", "--case", "CASE-5"]);
+    assert.equal(r.code, 1);
+    assert.match(r.err, /SeizeTooEarly/);
+    assert.equal((await ok(["forfeiture", "list", M])).out, "No forfeited accounts.");
+    const release = await cli(["forfeiture", "release", M, aliceAta.toBase58(), "--reason", "case-closed"]);
+    assert.equal(release.code, 1);
+    assert.match(release.err, /not forfeited/);
+    await ok(["thaw", M, aliceAta.toBase58(), "--reason", "case-closed"]);
+  });
+
+  it("commits to an amount with its own salt, offline", async () => {
+    const amountSalt = "amount-salt-not-for-production";
+    const expected = Buffer.from(amountCommitment(1_000n, amountSalt)).toString("hex");
+    assert.equal((await ok(["amount-commitment", "1000"], { env: { VIGILANTIS_AMOUNT_SALT: amountSalt } })).out, expected);
+    const file = join(home, "amount-salt.txt");
+    writeFileSync(file, `${amountSalt}\n`);
+    assert.equal((await ok(["amount-commitment", "1000", "--amount-salt-file", file])).out, expected);
+    // The case salt is not the amount salt.
+    const noSalt = await cli(["amount-commitment", "1000"]);
+    assert.equal(noSalt.code, 2);
+    assert.match(noSalt.err, /VIGILANTIS_AMOUNT_SALT/);
+    const notANumber = await cli(["amount-commitment", "1.5"], { env: { VIGILANTIS_AMOUNT_SALT: amountSalt } });
+    assert.equal(notANumber.code, 2);
   });
 
   it("hands the freeze authority out and back to Vigilantis", async () => {

@@ -10,6 +10,7 @@ export {
   PERMISSIONS,
   SEIZE_DELAY_SECONDS,
   caseRef,
+  amountCommitment,
   packInstructions,
   transactionSize,
 } from "./client";
@@ -22,6 +23,7 @@ export type {
   FreezeRecordView,
   SeizureView,
   SeizureOutcome,
+  ForfeitureView,
 } from "./client";
 export {
   META_LIST_SEED,
@@ -35,6 +37,7 @@ export {
   PERMANENT_DELEGATE_SEED,
   FREEZE_RECORD_SEED,
   SEIZURE_SEED,
+  FORFEITURE_SEED,
   metaListPda,
   policyPda,
   allowEntryPda,
@@ -46,5 +49,6 @@ export {
   permanentDelegatePda,
   freezeRecordPda,
   seizureRecordPda,
+  forfeitureRecordPda,
 } from "./pdas";
 export type { Vigilantis } from "./idl/vigilantis";
