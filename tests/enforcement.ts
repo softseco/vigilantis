@@ -18,7 +18,10 @@ import {
   AuthorityType,
   getAccountLen,
   getAssociatedTokenAddressSync,
+  getAccount,
+  getDefaultAccountState,
   getMint,
+  AccountState,
   ExtensionType,
 } from "@solana/spl-token";
 import {
@@ -32,7 +35,7 @@ import {
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import { assert } from "chai";
-import { ENFORCEMENT_REASONS, VigilantisClient, caseRef } from "../sdk/src";
+import { ENFORCEMENT_REASONS, VigilantisClient, caseRef, newCaseRef } from "../sdk/src";
 
 const CONFIRM = { commitment: "confirmed" as const };
 const SALT = "test-salt-not-for-production";
@@ -444,5 +447,53 @@ describe("vigilantis — enforcement: reasons, freeze and thaw", () => {
       message = String(e);
     }
     assert.match(message, /32 bytes/);
+  });
+
+  it("keeps the default account state for later, or starts every new account frozen", async () => {
+    const holder = (m: Keypair) => ata(alice.publicKey, m.publicKey);
+    const openAccount = (m: Keypair) =>
+      send([
+        createAssociatedTokenAccountInstruction(
+          payer.publicKey,
+          holder(m),
+          alice.publicKey,
+          m.publicKey,
+          TOKEN_2022_PROGRAM_ID,
+          ASSOCIATED_TOKEN_PROGRAM_ID,
+        ),
+      ]);
+
+    // "initialized": the extension is there, and new accounts start usable, as without it.
+    const later = Keypair.generate();
+    await client.createCompliantMint({ mint: later, decimals: 6, freezeAuthority: "vigilantis", defaultAccountState: "initialized" });
+    const laterInfo = await getMint(connection, later.publicKey, "confirmed", TOKEN_2022_PROGRAM_ID);
+    assert.equal(getDefaultAccountState(laterInfo)?.state, AccountState.Initialized);
+    await openAccount(later);
+    assert.isFalse((await getAccount(connection, holder(later), "confirmed", TOKEN_2022_PROGRAM_ID)).isFrozen);
+
+    // "frozen": a new account starts frozen, and Vigilantis's thaw opens it, with no freeze record.
+    const gated = Keypair.generate();
+    await client.createCompliantMint({ mint: gated, decimals: 6, freezeAuthority: "vigilantis", defaultAccountState: "frozen" });
+    await client.initializePolicy({ mint: gated.publicKey, allowlist: false, blocklist: true, maxTransferAmount: 0 });
+    await client.initializeExtraAccountMetaList(gated.publicKey);
+    await openAccount(gated);
+    assert.isTrue((await getAccount(connection, holder(gated), "confirmed", TOKEN_2022_PROGRAM_ID)).isFrozen);
+    await client.thawTokenAccount(gated.publicKey, holder(gated), { reasonCode: 0, caseRef: newCaseRef() });
+    assert.isFalse((await getAccount(connection, holder(gated), "confirmed", TOKEN_2022_PROGRAM_ID)).isFrozen);
+
+    // Without a freeze authority nothing could ever be thawed, so the SDK refuses before sending.
+    let message = "";
+    try {
+      await client.createCompliantMint({ mint: Keypair.generate(), decimals: 6, defaultAccountState: "frozen" });
+    } catch (e) {
+      message = String(e);
+    }
+    assert.match(message, /needs a freeze authority/);
+  });
+
+  it("makes a new random case reference each time", () => {
+    const [a, b] = [newCaseRef(), newCaseRef()];
+    assert.lengthOf(a, 32);
+    assert.notDeepEqual(Array.from(a), Array.from(b));
   });
 });

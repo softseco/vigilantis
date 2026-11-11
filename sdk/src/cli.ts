@@ -6,6 +6,7 @@
 // and outcomes, case references hashed with a salt that never goes on the command line, and an
 // export mode (`--multisig <vault>`) that prints transactions for a multisig to propose instead
 // of sending them. docs/deployment.md uses these commands in the runbook.
+import { randomBytes } from "crypto";
 import { readFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
@@ -21,9 +22,11 @@ import {
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import {
+  AccountState,
   AuthorityType,
   TOKEN_2022_PROGRAM_ID,
   createSetAuthorityInstruction,
+  getDefaultAccountState,
   getMint,
   getPermanentDelegate,
   getTransferHook,
@@ -101,6 +104,7 @@ const OPTIONS = {
   "allow-confidential": { type: "string" },
   freeze: { type: "boolean" },
   "give-up": { type: "boolean" },
+  new: { type: "boolean" },
 } as const;
 
 type OptionName = keyof typeof OPTIONS;
@@ -174,15 +178,11 @@ const PERMISSION_NAMES = Object.keys(PERMISSIONS).filter((p) => p !== "all").map
 const OUTCOMES: SeizureOutcome[] = ["returnedToOwner", "paidToVictim", "paidToState", "other"];
 
 /**
- * `--reason`. Optional (0, "unspecified") except where `required`: seizures and forfeitures always
- * record why. Freezes, pauses and blocks may have to happen within seconds, before anyone has a
- * case, so they never wait for one.
+ * `--reason`, always optional: without it the chain records 0, "unspecified". Why something was done
+ * can live in the case file the case reference points to, off chain, rather than on chain.
  */
-function reasonArg(value: string | boolean | undefined, required = false): number {
-  if (value === undefined) {
-    if (!required) return ENFORCEMENT_REASONS.unspecified;
-    throw new UsageError(`this command records why it was done: add --reason (${REASON_NAMES.join(", ")} or a number)`);
-  }
+function reasonArg(value: string | boolean | undefined): number {
+  if (value === undefined) return ENFORCEMENT_REASONS.unspecified;
   const v = String(value);
   if (/^\d+$/.test(v)) {
     const n = Number(v);
@@ -276,11 +276,18 @@ function salt(ctx: { values: Values; io: CliIo }): string {
   );
 }
 
-/** `--reason` and `--case`. Both optional, except for seizures and forfeitures (`caseRequired`). */
+/**
+ * `--reason` and the case. The reason is always optional; the case too, except for seizures and
+ * forfeitures (`caseRequired`), which the program refuses without one.
+ */
 function enforcement(ctx: Context, caseRequired = false): Enforcement {
-  const reasonCode = reasonArg(ctx.values.reason, caseRequired);
+  const reasonCode = reasonArg(ctx.values.reason);
   const ref = caseRefArg(ctx);
-  if (!ref && caseRequired) throw new UsageError("this command needs a case: add --case <id> or --case-ref <hex>");
+  if (!ref && caseRequired) {
+    throw new UsageError(
+      "this command needs a case: add --case-ref <hex> (a new one from `vigilantis case-ref --new`) or --case <id>",
+    );
+  }
   return { reasonCode, caseRef: ref ?? new Uint8Array(32) };
 }
 
@@ -595,6 +602,7 @@ const COMMANDS: Command[] = [
       const hook = hookExtension?.programId ?? null;
       const hookAuthority = hookExtension && !hookExtension.authority.equals(PublicKey.default) ? hookExtension.authority : null;
       const delegate = getPermanentDelegate(mintInfo)?.delegate ?? null;
+      const defaultState = getDefaultAccountState(mintInfo)?.state;
       const status = {
         mint,
         program: client.programId,
@@ -606,6 +614,7 @@ const COMMANDS: Command[] = [
         freezeAuthority: mintInfo.freezeAuthority,
         pause,
         permanentDelegate: delegate && !delegate.equals(PublicKey.default) ? delegate : null,
+        defaultAccountState: defaultState === undefined ? null : defaultState === AccountState.Frozen ? "frozen" : "initialized",
         roles: roles.map((r) => ({ ...r, permissionNames: permissionNames(r.permissions) })),
         seizures,
         forfeitures,
@@ -634,6 +643,14 @@ const COMMANDS: Command[] = [
         ["Freeze authority", named(mintInfo.freezeAuthority, client.freezeAuthority(mint))],
         ["Pause", pause ? `${pause.paused ? "PAUSED" : "running"} (authority: ${named(pause.authority, client.pauseAuthority(mint))})` : "not pausable"],
         ["Permanent delegate", named(status.permanentDelegate, client.permanentDelegate(mint))],
+        [
+          "New accounts",
+          status.defaultAccountState === null
+            ? "start usable (no default-state extension)"
+            : status.defaultAccountState === "frozen"
+              ? "start frozen until thawed (default state: frozen)"
+              : "start usable (default state: initialized)",
+        ],
         ["Roles", String(roles.length)],
         ...roles.map((r): [string, string] => [
           `  ${r.holder.toBase58()}`,
@@ -704,14 +721,21 @@ const COMMANDS: Command[] = [
   },
   {
     name: "case-ref",
-    usage: "<case-id>",
-    summary: "print the 32-byte case reference for a case ID, hashed with the salt",
+    usage: "<case-id> | --new",
+    summary: "print the 32-byte case reference for a case ID, hashed with the salt, or a new random one",
     group: "Reading",
-    options: ["case-salt-file"],
+    options: ["case-salt-file", "new"],
     offline: true,
     async run(ctx, [id]) {
-      if (id === undefined) throw new UsageError("missing case ID");
-      const ref = Buffer.from(caseRef(caseId(id, "the case ID"), salt(ctx))).toString("hex");
+      if (ctx.values.new) {
+        if (id !== undefined) throw new UsageError("give a case ID or --new, not both");
+        if (ctx.values["case-salt-file"] !== undefined) throw new UsageError("--new takes no salt: the reference is random");
+      } else if (id === undefined) {
+        throw new UsageError("missing case ID, or --new for a random case reference");
+      }
+      // A random reference ties nothing on chain to a case number: the register that maps it to the
+      // case is kept off chain, and can change without touching the chain.
+      const ref = Buffer.from(ctx.values.new ? randomBytes(32) : caseRef(caseId(id!, "the case ID"), salt(ctx))).toString("hex");
       if (ctx.values.json) return json(ctx, { caseRef: ref });
       ctx.io.out(ref);
     },
@@ -842,7 +866,7 @@ const COMMANDS: Command[] = [
   },
   {
     name: "block add",
-    usage: "<mint> <wallet>... [--reason <r>] [--case <id>] [--freeze]",
+    usage: "<mint> <wallet>... [--reason <r>] [--case-ref <hex>] [--freeze]",
     summary: "blocklist wallets; with --reason, record why; with --freeze, also freeze the wallet's accounts",
     group: "Lists (the policy authority or a role)",
     options: [...ENFORCEMENT, "freeze"],
@@ -851,7 +875,7 @@ const COMMANDS: Command[] = [
   },
   {
     name: "block remove",
-    usage: "<mint> <wallet>... [--reason <r>] [--case <id>]",
+    usage: "<mint> <wallet>... [--reason <r>] [--case-ref <hex>]",
     summary: "take wallets off the blocklist; with --reason, record why",
     group: "Lists (the policy authority or a role)",
     options: ENFORCEMENT,
@@ -862,7 +886,7 @@ const COMMANDS: Command[] = [
   // Enforcement
   {
     name: "freeze",
-    usage: "<mint> <wallet|token-account> [--reason <r>] [--case <id>]",
+    usage: "<mint> <wallet|token-account> [--reason <r>] [--case-ref <hex>]",
     summary: "freeze a token account, or every token account of a wallet",
     group: "Enforcement (the policy authority or a role)",
     options: ENFORCEMENT,
@@ -871,7 +895,7 @@ const COMMANDS: Command[] = [
   },
   {
     name: "thaw",
-    usage: "<mint> <wallet|token-account> [--reason <r>] [--case <id>]",
+    usage: "<mint> <wallet|token-account> [--reason <r>] [--case-ref <hex>]",
     summary: "thaw a token account, or every frozen token account of a wallet",
     group: "Enforcement (the policy authority or a role)",
     options: ENFORCEMENT,
@@ -880,7 +904,7 @@ const COMMANDS: Command[] = [
   },
   {
     name: "pause",
-    usage: "<mint> [--reason <r>] [--case <id>]",
+    usage: "<mint> [--reason <r>] [--case-ref <hex>]",
     summary: "stop every transfer, mint and burn of the token",
     group: "Enforcement (the policy authority or a role)",
     options: ENFORCEMENT,
@@ -893,7 +917,7 @@ const COMMANDS: Command[] = [
   },
   {
     name: "resume",
-    usage: "<mint> [--reason <r>] [--case <id>]",
+    usage: "<mint> [--reason <r>] [--case-ref <hex>]",
     summary: "end a pause",
     group: "Enforcement (the policy authority or a role)",
     options: ENFORCEMENT,
@@ -906,7 +930,7 @@ const COMMANDS: Command[] = [
   },
   {
     name: "seize",
-    usage: "<mint> <token-account> --reason <r> --case <id>",
+    usage: "<mint> <token-account> --case-ref <hex> [--reason <r>]",
     summary: "burn the public balance of an account frozen through Vigilantis at least 24 hours ago",
     group: "Enforcement (the policy authority or a role)",
     options: ENFORCEMENT,
@@ -920,7 +944,7 @@ const COMMANDS: Command[] = [
   },
   {
     name: "seizure close",
-    usage: "<mint> <token-account> --case <id> --outcome <o> --reason <r>",
+    usage: "<mint> <token-account> --case-ref <hex> --outcome <o> [--reason <r>]",
     summary: "close a seizure with its outcome: returned-to-owner, paid-to-victim, paid-to-state, other",
     group: "Enforcement (the policy authority or a role)",
     options: [...ENFORCEMENT, "outcome"],
@@ -954,7 +978,7 @@ const COMMANDS: Command[] = [
   },
   {
     name: "forfeit",
-    usage: "<mint> <token-account> --reason <r> --case <id> [--amount-commitment <hex>]",
+    usage: "<mint> <token-account> --case-ref <hex> [--reason <r>] [--amount-commitment <hex>]",
     summary: "end a case whose balance cannot be seized: the account, frozen 24 hours or more, stays frozen until released",
     group: "Enforcement (the policy authority or a role)",
     options: [...ENFORCEMENT, "amount-commitment"],
@@ -975,7 +999,7 @@ const COMMANDS: Command[] = [
   },
   {
     name: "forfeiture release",
-    usage: "<mint> <token-account> --reason <r>",
+    usage: "<mint> <token-account> [--reason <r>]",
     summary: "remove a forfeiture, for example after an appeal, so the account can be thawed (the admin only)",
     group: "Enforcement (the policy authority or a role)",
     options: ["reason"],
@@ -983,7 +1007,7 @@ const COMMANDS: Command[] = [
     async run(ctx, [m, t]) {
       const mint = address(m, "mint");
       const tokenAccount = address(t, "token account");
-      const reasonCode = reasonArg(ctx.values.reason, true);
+      const reasonCode = reasonArg(ctx.values.reason);
       if (!(await ctx.client.getForfeiture(mint, tokenAccount))) {
         throw new Error(`${tokenAccount.toBase58()} is not forfeited`);
       }
@@ -1126,7 +1150,7 @@ const COMMANDS: Command[] = [
   },
   {
     name: "freeze-authority set",
-    usage: "<mint> <address|none> [--reason <r>] [--case <id>] [--give-up]",
+    usage: "<mint> <address|none> [--reason <r>] [--case-ref <hex>] [--give-up]",
     summary: "hand the mint's freeze authority from Vigilantis to an address, or give it up",
     group: "Authorities (the policy authority)",
     options: [...ENFORCEMENT, "give-up"],
@@ -1143,7 +1167,7 @@ const COMMANDS: Command[] = [
   },
   {
     name: "pause-authority set",
-    usage: "<mint> <address|none> [--reason <r>] [--case <id>] [--give-up]",
+    usage: "<mint> <address|none> [--reason <r>] [--case-ref <hex>] [--give-up]",
     summary: "hand the mint's pause authority from Vigilantis to an address, or give it up",
     group: "Authorities (the policy authority)",
     options: [...ENFORCEMENT, "give-up"],
@@ -1187,11 +1211,13 @@ function help(): string {
     "  -h, --help, -V, --version",
     "",
     "Why and which case (recorded on chain in the EnforcementAction event). Optional, so a freeze or a pause",
-    "never waits; seize and forfeit need both, seizure close and forfeiture release need a reason.",
+    "never waits; seize, seizure close and forfeit need a case. The reason is always optional: without it the",
+    "chain records 0 (unspecified), and why lives in the case file.",
     `      --reason <reason>   ${REASON_NAMES.join(", ")}, or a number 0-65535.`,
-    "      --case <id>         The case ID, hashed with a salt from VIGILANTIS_CASE_SALT or --case-salt-file <path>,",
-    "                          so the chain holds no case number. Keep the salt private and always the same.",
-    "      --case-ref <hex>    The 32-byte case reference itself, as `case-ref` or `seizure list` prints it.",
+    "      --case-ref <hex>    The 32-byte case reference, as `case-ref --new` (random) or `seizure list` prints it.",
+    "                          Keep a register of which reference is which case; the chain holds no case number.",
+    "      --case <id>         Or the case ID, hashed with a salt from VIGILANTIS_CASE_SALT or --case-salt-file <path>.",
+    "                          Keep the salt private and always the same.",
     "      --amount-commitment <hex>  For forfeit: the 32 bytes `amount-commitment` prints, with its salt from",
     "                          VIGILANTIS_AMOUNT_SALT or --amount-salt-file <path>. Keep that salt private too.",
     "",

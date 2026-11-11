@@ -10,6 +10,7 @@ export {
   PERMISSIONS,
   SEIZE_DELAY_SECONDS,
   caseRef,
+  newCaseRef,
   amountCommitment,
   packInstructions,
   transactionSize,

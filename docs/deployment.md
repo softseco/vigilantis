@@ -232,18 +232,25 @@ vigilantis role list <MINT>
 
 ## Emergency procedures
 
-Every enforcement command records a reason (`--reason`) and a case reference (`--case`) in the
-`EnforcementAction` event. Both are optional, so a freeze, a block or a pause never waits for
-paperwork; `seize` and `forfeit` need both, `seizure close` and `forfeiture release` a reason.
-Give them whenever you can: they cannot be added to the event afterwards, so an action taken
-without them goes into the case register by its transaction signature. The salt for `--case`
-comes from `VIGILANTIS_CASE_SALT` or `--case-salt-file`; each issuer keeps one salt, privately,
-for good.
+Every enforcement command records a case reference and a reason code in the `EnforcementAction`
+event. Both are optional, so a freeze, a block or a pause never waits for paperwork; `seize`,
+`seizure close` and `forfeit` need a case. The reason is always optional (0, unspecified, without
+`--reason`): why something was done belongs in the case file, off chain.
+
+The simplest case reference is a random one: `vigilantis case-ref --new` prints 32 random bytes in
+hex, given to every command of the case with `--case-ref <HEX>`. Nothing on chain links it to a
+case number. Keep a register, off chain, of which reference is which case (and of every command:
+which officer or wallet, the transaction, the date and time); a case can be renumbered there
+without touching the chain. Give a case reference whenever you can: it cannot be added to the event
+afterwards, so an action taken without one goes into the register by its transaction signature.
+`--case <CASE_ID>` is the alternative: the case number hashed with a salt from
+`VIGILANTIS_CASE_SALT` or `--case-salt-file`, which each issuer keeps privately, for good.
 
 **A wallet must be stopped now** (sanctions match, stolen funds, a court order). An officer runs:
 
 ```bash
-vigilantis block add <MINT> <WALLET> --reason sanctions --case <CASE_ID> --freeze
+vigilantis case-ref --new             # once per case, into the register
+vigilantis block add <MINT> <WALLET> --case-ref <HEX> --freeze
 vigilantis check <MINT> <WALLET>     # Blocklisted: yes; every token account frozen
 ```
 
@@ -255,7 +262,7 @@ the command lists the ones that went through; run `vigilantis freeze <MINT> <WAL
 regulator's request):
 
 ```bash
-vigilantis pause <MINT> --reason internal-review --case <CASE_ID>
+vigilantis pause <MINT> --case-ref <HEX>
 vigilantis status <MINT>             # Pause: PAUSED
 ```
 
@@ -268,7 +275,7 @@ withdraw it to the public balance). The account must have been frozen through Vi
 
 ```bash
 vigilantis amount-commitment <AMOUNT>     # base units; salt from VIGILANTIS_AMOUNT_SALT, kept like the case salt
-vigilantis forfeit <MINT> <TOKEN_ACCOUNT> --reason court-order --case <CASE_ID> --amount-commitment <HEX> --multisig <ISSUER_VAULT>
+vigilantis forfeit <MINT> <TOKEN_ACCOUNT> --case-ref <HEX> --amount-commitment <HEX> --multisig <ISSUER_VAULT>
 vigilantis forfeiture list <MINT>
 ```
 
@@ -277,8 +284,8 @@ balances apart from the supply in circulation, and keep the amount and its salt 
 so the commitment can be shown to a court or an auditor. If the decision is overturned:
 
 ```bash
-vigilantis forfeiture release <MINT> <TOKEN_ACCOUNT> --reason case-closed --multisig <ISSUER_VAULT>
-vigilantis thaw <MINT> <TOKEN_ACCOUNT> --reason case-closed --case <CASE_ID> --multisig <ISSUER_VAULT>
+vigilantis forfeiture release <MINT> <TOKEN_ACCOUNT> --multisig <ISSUER_VAULT>
+vigilantis thaw <MINT> <TOKEN_ACCOUNT> --case-ref <HEX> --multisig <ISSUER_VAULT>
 ```
 
 If the holder cooperates instead, keep the wallet blocked, thaw the account, let the holder withdraw

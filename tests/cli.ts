@@ -24,7 +24,7 @@ import { assert } from "chai";
 import { mkdtempSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { VigilantisClient, amountCommitment, caseRef } from "../sdk/src";
+import { ENFORCEMENT_REASONS, VigilantisClient, amountCommitment, caseRef } from "../sdk/src";
 import { main } from "../sdk/src/cli";
 
 const CONFIRM = { commitment: "confirmed" as const };
@@ -152,13 +152,14 @@ describe("vigilantis — command line", () => {
   it("refuses a command line it cannot run, with exit code 2", async () => {
     const cases: [string[], RegExp][] = [
       [["launch", M], /unknown command/],
-      [["seize", M, aliceAta.toBase58(), "--case", "CASE-4"], /--reason/],
+      [["case-ref", "CASE-1", "--new"], /not both/],
+      [["case-ref"], /--new/],
       [["freeze", M, alice.publicKey.toBase58(), "--reason", "weather"], /unknown reason weather/],
       [["role", "list", M, "--reason", "fraud"], /--reason does not apply to `role list`/],
       [["policy", "update", M], /nothing to change/],
       [["policy", "show", "not-an-address"], /mint is not a valid address/],
       [["freeze-authority", "set", M, "none", "--reason", "fraud"], /--give-up/],
-      [["seize", M, aliceAta.toBase58(), "--reason", "court-order"], /needs a case/],
+      [["seize", M, aliceAta.toBase58(), "--reason", "court-order"], /needs a case.*case-ref --new/],
       [["role", "grant", M, officer.publicKey.toBase58(), "--permissions", "freeze,fly"], /unknown permission fly/],
       [["policy", "init", M, "--multisig", vault.publicKey.toBase58()], /authority propose/],
     ];
@@ -177,6 +178,15 @@ describe("vigilantis — command line", () => {
   it("hashes a case ID with the salt, offline", async () => {
     const r = await ok(["case-ref", "CASE-1"]);
     assert.equal(r.out, Buffer.from(caseRef("CASE-1", SALT)).toString("hex"));
+  });
+
+  it("prints a new random case reference, offline", async () => {
+    const [a, b] = [(await ok(["case-ref", "--new"])).out, (await ok(["case-ref", "--new", "--json"])).json().caseRef];
+    assert.match(a, /^[0-9a-f]{64}$/);
+    assert.match(b, /^[0-9a-f]{64}$/);
+    assert.notEqual(a, b);
+    // No salt is involved: it works with none set.
+    assert.match((await ok(["case-ref", "--new"], { env: { VIGILANTIS_CASE_SALT: "" } })).out, /^[0-9a-f]{64}$/);
   });
 
   it("hashes a case the same way however the case ID and the salt are written", async () => {
@@ -264,6 +274,17 @@ describe("vigilantis — command line", () => {
     assert.isTrue(await isFrozen(aliceSecond));
     await ok(["thaw", M, A, "--reason", "case-closed"]);
     assert.isFalse(await isFrozen(aliceSecond));
+
+    // With a new random case reference and no reason: the chain holds the reference as it is, and 0
+    // (unspecified).
+    const ref = (await ok(["case-ref", "--new"])).out;
+    const frozen = await ok(["freeze", M, aliceAta.toBase58(), "--case-ref", ref, "--json"]);
+    const action = (await sdk.getEvents(frozen.json().signatures[0])).find((e) => e.name === "enforcementAction");
+    assert.exists(action);
+    assert.equal(action!.data.reasonCode, ENFORCEMENT_REASONS.unspecified);
+    assert.equal(Buffer.from(action!.data.caseRef as number[]).toString("hex"), ref);
+    await ok(["thaw", M, aliceAta.toBase58(), "--case-ref", ref]);
+    assert.isFalse(await isFrozen(aliceAta));
   });
 
   it("pauses and resumes the token, and shows it in the status", async () => {
@@ -273,6 +294,7 @@ describe("vigilantis — command line", () => {
     assert.match(status.out, /Pause\s+PAUSED \(authority: Vigilantis/);
     assert.match(status.out, /Freeze authority\s+Vigilantis/);
     assert.match(status.out, /Transfer hook\s+Vigilantis/);
+    assert.match(status.out, /New accounts\s+start usable \(no default-state extension\)/);
     await ok(["resume", M, "--reason", "internal-review"]);
     assert.isFalse((await sdk.getPauseState(mint.publicKey))!.paused);
   });
@@ -298,8 +320,9 @@ describe("vigilantis — command line", () => {
 
   it("refuses a seizure before the 24 hours have passed", async () => {
     await ok(["freeze", M, aliceAta.toBase58(), "--reason", "court-order", "--case", "CASE-4"]);
-    const r = await cli(["seize", M, aliceAta.toBase58(), "--reason", "court-order", "--case", "CASE-4"]);
-    assert.equal(r.code, 1);
+    // No reason needed: the command line goes through, and the program refuses it for the delay.
+    const r = await cli(["seize", M, aliceAta.toBase58(), "--case", "CASE-4"]);
+    assert.equal(r.code, 1, r.err);
     assert.match(r.err, /SeizeTooEarly/);
     assert.equal((await ok(["seizure", "list", M])).out, "No open seizures.");
     await ok(["thaw", M, aliceAta.toBase58(), "--reason", "case-closed"]);
@@ -324,7 +347,7 @@ describe("vigilantis — command line", () => {
     assert.equal(r.code, 1);
     assert.match(r.err, /SeizeTooEarly/);
     assert.equal((await ok(["forfeiture", "list", M])).out, "No forfeited accounts.");
-    const release = await cli(["forfeiture", "release", M, aliceAta.toBase58(), "--reason", "case-closed"]);
+    const release = await cli(["forfeiture", "release", M, aliceAta.toBase58()]);
     assert.equal(release.code, 1);
     assert.match(release.err, /not forfeited/);
     await ok(["thaw", M, aliceAta.toBase58(), "--reason", "case-closed"]);

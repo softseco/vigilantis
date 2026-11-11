@@ -10,9 +10,11 @@ import {
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import {
+  AccountState,
   AuthorityType,
   ExtensionType,
   TOKEN_2022_PROGRAM_ID,
+  createInitializeDefaultAccountStateInstruction,
   createInitializeMintInstruction,
   createInitializePausableConfigInstruction,
   createInitializePermanentDelegateInstruction,
@@ -27,6 +29,7 @@ import {
   unpackAccount,
 } from "@solana/spl-token";
 import { sha256 } from "@noble/hashes/sha2";
+import { randomBytes } from "@noble/hashes/utils";
 import idl from "./idl/vigilantis.json";
 import type { Vigilantis } from "./idl/vigilantis";
 import {
@@ -132,6 +135,16 @@ export const ENFORCEMENT_REASONS = {
 export function caseRef(caseId: string, salt: string | Uint8Array): Uint8Array {
   const saltBytes = typeof salt === "string" ? Buffer.from(salt, "utf8") : Buffer.from(salt);
   return sha256(Buffer.concat([saltBytes, Buffer.from(caseId, "utf8")]));
+}
+
+/**
+ * A new random 32-byte case reference for `Enforcement.caseRef`. Nothing on chain links it to a
+ * case number: the issuer keeps the register of which reference is which case, off chain, and can
+ * change a case's number there without touching the chain. Use it instead of {@link caseRef} when
+ * the case numbers themselves should not be derivable from anything, salt included.
+ */
+export function newCaseRef(): Uint8Array {
+  return randomBytes(32);
 }
 
 /**
@@ -359,6 +372,16 @@ export class VigilantisClient {
    *   a seized public balance. Explorers show that a mint has a permanent delegate.
    *
    * For `seize`, use both with `freezeAuthority: "vigilantis"`.
+   *
+   * `defaultAccountState` adds Token-2022's DefaultAccountState extension, also only possible here:
+   * - `"initialized"` changes nothing today (new token accounts start usable, as without it) and
+   *   keeps the option of switching new accounts to frozen later;
+   * - `"frozen"` makes every new token account start frozen until it is thawed, a gate in front of
+   *   the token itself (it needs a freeze authority).
+   * Token-2022 lets only the mint's freeze authority change the default later. With
+   * `freezeAuthority: "vigilantis"` that is Vigilantis's own address, and this version of the
+   * program has no instruction for it yet: the switch comes with a later version (the program is
+   * upgraded in place).
    */
   async createCompliantMint(params: {
     mint: Keypair;
@@ -373,6 +396,7 @@ export class VigilantisClient {
      * or `null` so that nobody can ever change it (Vigilantis itself can still be upgraded in place).
      */
     transferHookAuthority?: PublicKey | null;
+    defaultAccountState?: "initialized" | "frozen";
   }): Promise<PublicKey> {
     const mint = params.mint.publicKey;
     const authority = params.mintAuthority ?? this.payer.publicKey;
@@ -392,6 +416,17 @@ export class VigilantisClient {
     if (params.pausable) {
       extensions.push(ExtensionType.PausableConfig);
       extensionIxs.push(createInitializePausableConfigInstruction(mint, this.pauseAuthority(mint), TOKEN_2022_PROGRAM_ID));
+    }
+    if (params.defaultAccountState !== undefined) {
+      const state = { initialized: AccountState.Initialized, frozen: AccountState.Frozen }[params.defaultAccountState];
+      if (state === undefined) {
+        throw new Error(`defaultAccountState must be "initialized" or "frozen", got ${String(params.defaultAccountState)}`);
+      }
+      if (state === AccountState.Frozen && !freezeAuthority) {
+        throw new Error('defaultAccountState "frozen" needs a freeze authority, or no account could ever be thawed');
+      }
+      extensions.push(ExtensionType.DefaultAccountState);
+      extensionIxs.push(createInitializeDefaultAccountStateInstruction(mint, state, TOKEN_2022_PROGRAM_ID));
     }
     const mintLen = getMintLen(extensions);
     const lamports = await this.connection.getMinimumBalanceForRentExemption(mintLen);

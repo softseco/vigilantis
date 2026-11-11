@@ -141,6 +141,19 @@ Since 1.0.0-rc.2 (see "Forfeiture" below):
   as `enforcementAction` kinds
 - `thawWallet` leaves forfeited accounts frozen and thaws the rest
 
+Unreleased:
+
+- `newCaseRef()`: a random 32-byte case reference, linked to no case number on chain; keep your
+  own register of which reference is which case
+- `createCompliantMint({ ..., defaultAccountState: "initialized" | "frozen" })`: Token-2022's
+  DefaultAccountState extension, which can only be added when the mint is created. `"initialized"`
+  changes nothing today and keeps the option of new accounts starting frozen; `"frozen"` makes
+  every new token account start frozen until it is thawed. Token-2022 lets only the mint's freeze
+  authority change the default later; for a mint with `freezeAuthority: "vigilantis"` that needs a
+  later version of the program. `vigilantis status` shows it ("New accounts")
+- Command line: `--reason` is optional everywhere, `seizure close` and `forfeiture release`
+  included; `vigilantis case-ref --new`
+
 ## Policy authority held by a multisig
 
 The `VigilantisClient` methods sign with the provider wallet. When the policy authority is a
@@ -172,7 +185,8 @@ scripts. Every command is a thin layer over `VigilantisClient`.
 npx vigilantis help
 npx vigilantis status <mint>
 npx vigilantis check <mint> <wallet>
-npx vigilantis block add <mint> <wallet> --reason sanctions --case OFAC-2026-17 --freeze
+npx vigilantis case-ref --new
+npx vigilantis block add <mint> <wallet> --case-ref <hex> --freeze
 npx vigilantis pause <mint> --reason internal-review
 npx vigilantis role grant <mint> <officer> --permissions block,unblock,freeze,thaw --multisig <vault>
 ```
@@ -180,12 +194,16 @@ npx vigilantis role grant <mint> <officer> --permissions block,unblock,freeze,th
 - **RPC and signer:** `--url` (a URL, or `mainnet-beta`, `devnet`, `localhost`) and `--keypair`;
   without them, `VIGILANTIS_RPC_URL` and then the Solana CLI config. Keep an RPC URL with an API key
   in the environment or the config, not on the command line.
-- **Why:** `--reason` (`sanctions`, `court-order`, `fraud`, ... or a number) and `--case <id>` are
+- **Why:** a case reference and `--reason` (`sanctions`, `court-order`, `fraud`, ... or a number) are
   recorded with the action. They are optional, so a freeze, a block or a pause during an incident
-  never waits for paperwork; give them whenever you can, because they cannot be added afterwards.
-  `seize` and `forfeit` need both; `seizure close` and `forfeiture release` need a reason. The case
-  is hashed with a salt from `VIGILANTIS_CASE_SALT` or `--case-salt-file`; the salt never goes on
-  the command line. `vigilantis case-ref <id>` prints the hash.
+  never waits for paperwork; a case reference cannot be added afterwards, so give one whenever you
+  can. `seize`, `seizure close` and `forfeit` need a case. The reason is always optional: without it
+  the chain records 0 (unspecified), and why lives in the case file instead. Two ways to give the
+  case: `--case-ref <hex>` with a random reference from `vigilantis case-ref --new`, which ties
+  nothing on chain to a case number (keep your own register of which reference is which case), or
+  `--case <id>`, the case number hashed with a salt from `VIGILANTIS_CASE_SALT` or
+  `--case-salt-file` (the salt never goes on the command line; `vigilantis case-ref <id>` prints
+  the hash).
 - **Multisig:** `--multisig <vault>` sends nothing and needs no keypair. It prints each transaction
   in base58, with the vault as signer, for Squads ("Add instruction", then "Import base58 encoded
   tx"). Long lists are split so each transaction leaves the multisig room for its own wrapper.

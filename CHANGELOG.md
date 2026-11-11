@@ -5,6 +5,36 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The on-chain
 `@softseco/vigilantis` SDK are versioned together. Until 28 Oct 2026 the project was Sentinel
 (`@softseco/sentinel`, up to 2.3.0); that history is kept below, under Sentinel's version numbers.
 
+## [Unreleased]
+
+Reasons optional everywhere on the command line, random case references, and the
+DefaultAccountState extension at mint creation. The on-chain program does not change.
+
+### Added
+- **Random case references.** `vigilantis case-ref --new` prints 32 random bytes in hex, offline
+  and without a salt, for `--case-ref`; `newCaseRef()` in the SDK. Nothing on chain links such a
+  reference to a case number: the issuer keeps the register of which reference is which case, off
+  chain, and can renumber a case there without touching the chain.
+- **DefaultAccountState.** `createCompliantMint({ ..., defaultAccountState: "initialized" | "frozen" })`
+  adds Token-2022's DefaultAccountState extension, which can only be added when the mint is
+  created. `"initialized"` changes nothing today and keeps the option of new token accounts
+  starting frozen; `"frozen"` makes every new token account start frozen until it is thawed
+  (`thaw` needs no freeze record for that), and is refused without a freeze authority. Token-2022
+  lets only the mint's freeze authority change the default later; with
+  `freezeAuthority: "vigilantis"` that needs a later version of the program. `vigilantis status`
+  shows it as "New accounts", and `--json` as `defaultAccountState`.
+- **Tests:** 3 more integration tests (99 in all): a new random case reference, offline, and
+  recorded as it is by a freeze without a reason; a mint with each default account state, a new
+  account that starts frozen and is thawed through Vigilantis, and the refusal without a freeze
+  authority; `newCaseRef`. `seize` and `forfeiture release` are now tested without a reason.
+
+### Changed
+- **Command line:** `--reason` is optional for every command, `seizure close` and
+  `forfeiture release` included; without it the chain records 0 (unspecified), and why lives in
+  the case file. `seize`, `seizure close` and `forfeit` still need a case, which the program
+  requires, and the error now points to `case-ref --new`. The usage lines show `--case-ref <hex>`;
+  `--case <id>` with the salt still works.
+
 ## [1.0.0-rc.2] - 2026-11-05
 
 Forfeiture, for a case that ends with a balance Vigilantis cannot seize, and reasons that are
